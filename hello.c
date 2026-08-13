@@ -38,13 +38,15 @@ static int map_idx;
 
 static volatile char capture_status;
 
-// ===== 新增:埋点计数器,不影响原有逻辑 =====
 static volatile unsigned int cnt_hookA_before;
 static volatile unsigned int cnt_hookA_after;
 static volatile unsigned int cnt_hookB_total;
 static volatile unsigned int cnt_hookB_wrong_status;
 static volatile unsigned int cnt_hookB_no_handle;
 static volatile unsigned int cnt_hookB_getcpu_fail;
+
+// 新增:只在武装状态下,前3次触发Hook B时做一次原始内存dump,避免刷屏
+static volatile int dump_count;
 
 
 static void record_iova_mapping(uint32_t iova, int32_t handle)
@@ -83,20 +85,19 @@ static int is_err_ptr(void *ptr)
 
 static void before_get_io_buf(hook_fargs3_t *args, void *udata)
 {
-    cnt_hookA_before++;  // 新增
+    cnt_hookA_before++;
     args->local.data0 = args->arg0;
 }
 
 
 static void after_get_io_buf(hook_fargs3_t *args, void *udata)
 {
-    cnt_hookA_after++;  // 新增
+    cnt_hookA_after++;
     int32_t handle = (int32_t)args->local.data0;
     dma_addr_t *iova = (dma_addr_t *)args->arg2;
 
     if (iova && handle) {
         record_iova_mapping((uint32_t)*iova, handle);
-        pr_info("cam-raw-dump: hookA recorded iova=%x handle=%d\n", (uint32_t)*iova, handle);  // 新增
     }
 }
 
@@ -115,17 +116,37 @@ static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
 {
     struct cam_isp_hw_done_event_data *evt;
 
-    cnt_hookB_total++;  // 新增
+    cnt_hookB_total++;
 
     if (capture_status != 1) {
-        cnt_hookB_wrong_status++;  // 新增
+        cnt_hookB_wrong_status++;
         return;
     }
 
     evt = (struct cam_isp_hw_done_event_data *)args->arg1;
 
-    if (!evt || !evt->num_handles) {
-        pr_info("cam-raw-dump: hookB armed but evt invalid, evt=%p\n", evt);  // 新增
+    if (!evt) {
+        pr_info("cam-raw-dump: hookB evt is NULL\n");
+        return;
+    }
+
+    // 新增:原始内存dump,不依赖结构体字段名,直接看evt指针后面64字节的原始内容
+    // 只dump前3次,避免刷屏
+    if (dump_count < 3) {
+        dump_count++;
+        uint32_t *raw = (uint32_t *)evt;
+        pr_info("cam-raw-dump: RAWDUMP evt=%p\n", evt);
+        pr_info("cam-raw-dump: RAW[0-3]  = %x %x %x %x\n", raw[0], raw[1], raw[2], raw[3]);
+        pr_info("cam-raw-dump: RAW[4-7]  = %x %x %x %x\n", raw[4], raw[5], raw[6], raw[7]);
+        pr_info("cam-raw-dump: RAW[8-11] = %x %x %x %x\n", raw[8], raw[9], raw[10], raw[11]);
+        pr_info("cam-raw-dump: RAW[12-15]= %x %x %x %x\n", raw[12], raw[13], raw[14], raw[15]);
+
+        // 也打印args里的其他寄存器值,可能evt根本不在arg1这个位置
+        pr_info("cam-raw-dump: args arg0=%llx arg1=%llx\n",
+                (unsigned long long)args->arg0, (unsigned long long)args->arg1);
+    }
+
+    if (!evt->num_handles) {
         return;
     }
 
@@ -135,26 +156,21 @@ static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
     uint32_t iova = evt->last_consumed_addr[0];
     int32_t handle = lookup_buf_handle(iova);
 
-    pr_info("cam-raw-dump: hookB armed, iova=%x lookup_handle=%d\n", iova, handle);  // 新增
-
     if (!handle) {
-        cnt_hookB_no_handle++;  // 新增
+        cnt_hookB_no_handle++;
         return;
     }
 
     uintptr_t vaddr = 0;
     size_t len = 0;
 
-    int rc = p_cam_mem_get_cpu_buf(handle, &vaddr, &len);
-    pr_info("cam-raw-dump: hookB get_cpu_buf rc=%d vaddr=%lx len=%zu\n", rc, vaddr, len);  // 新增
-
-    if (rc) {
-        cnt_hookB_getcpu_fail++;  // 新增
+    if (p_cam_mem_get_cpu_buf(handle, &vaddr, &len)) {
+        cnt_hookB_getcpu_fail++;
         return;
     }
 
     if (!vaddr || !len) {
-        cnt_hookB_getcpu_fail++;  // 新增
+        cnt_hookB_getcpu_fail++;
         return;
     }
 
@@ -277,8 +293,9 @@ static long cam_kpm_control0(
     if (args[0] == 'c') {
 
         capture_status = 1;
+        dump_count = 0;  // 新增:每次武装时重置dump计数,方便重复测试
 
-        pr_info("cam-raw-dump: control0 armed, capture_status=%d\n", capture_status);  // 新增
+        pr_info("cam-raw-dump: control0 armed, capture_status=%d\n", capture_status);
 
         compat_copy_to_user(
             out_msg,
@@ -288,7 +305,6 @@ static long cam_kpm_control0(
 
     } else if (args[0] == 's') {
 
-        // 新增:一次性打印所有计数器
         pr_info("cam-raw-dump: status=%d hookA_before=%u hookA_after=%u "
                 "hookB_total=%u hookB_wrongstatus=%u hookB_nohandle=%u hookB_getcpufail=%u\n",
                 capture_status, cnt_hookA_before, cnt_hookA_after,
