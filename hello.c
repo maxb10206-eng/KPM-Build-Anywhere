@@ -45,7 +45,6 @@ static volatile unsigned int cnt_hookB_wrong_status;
 static volatile unsigned int cnt_hookB_no_handle;
 static volatile unsigned int cnt_hookB_getcpu_fail;
 
-// 新增:只在武装状态下,前3次触发Hook B时做一次原始内存dump,避免刷屏
 static volatile int dump_count;
 
 
@@ -102,9 +101,12 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
 }
 
 
+// 新假设结构体:前面加16字节list_head前缀
 #define CAM_NUM_OUT_PER_COMP_IRQ_MAX 6
 
-struct cam_isp_hw_done_event_data {
+struct cam_isp_hw_done_event_data_v2 {
+    void *list_next;
+    void *list_prev;
     uint32_t num_handles;
     uint32_t resource_handle[CAM_NUM_OUT_PER_COMP_IRQ_MAX];
     uint32_t last_consumed_addr[CAM_NUM_OUT_PER_COMP_IRQ_MAX];
@@ -114,8 +116,6 @@ struct cam_isp_hw_done_event_data {
 
 static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
 {
-    struct cam_isp_hw_done_event_data *evt;
-
     cnt_hookB_total++;
 
     if (capture_status != 1) {
@@ -123,28 +123,26 @@ static void before_vfe_out_done(hook_fargs2_t *args, void *udata)
         return;
     }
 
-    evt = (struct cam_isp_hw_done_event_data *)args->arg1;
+    void *evt_ptr = (void *)args->arg1;
 
-    if (!evt) {
-        pr_info("cam-raw-dump: hookB evt is NULL\n");
+    if (!evt_ptr) {
         return;
     }
 
-    // 新增:原始内存dump,不依赖结构体字段名,直接看evt指针后面64字节的原始内容
-    // 只dump前3次,避免刷屏
+    // 扩大dump范围到raw[0]~raw[23],覆盖96字节,足够看到真正的last_consumed_addr
     if (dump_count < 3) {
         dump_count++;
-        uint32_t *raw = (uint32_t *)evt;
-        pr_info("cam-raw-dump: RAWDUMP evt=%p\n", evt);
+        uint32_t *raw = (uint32_t *)evt_ptr;
         pr_info("cam-raw-dump: RAW[0-3]  = %x %x %x %x\n", raw[0], raw[1], raw[2], raw[3]);
         pr_info("cam-raw-dump: RAW[4-7]  = %x %x %x %x\n", raw[4], raw[5], raw[6], raw[7]);
         pr_info("cam-raw-dump: RAW[8-11] = %x %x %x %x\n", raw[8], raw[9], raw[10], raw[11]);
         pr_info("cam-raw-dump: RAW[12-15]= %x %x %x %x\n", raw[12], raw[13], raw[14], raw[15]);
-
-        // 也打印args里的其他寄存器值,可能evt根本不在arg1这个位置
-        pr_info("cam-raw-dump: args arg0=%llx arg1=%llx\n",
-                (unsigned long long)args->arg0, (unsigned long long)args->arg1);
+        pr_info("cam-raw-dump: RAW[16-19]= %x %x %x %x\n", raw[16], raw[17], raw[18], raw[19]);
+        pr_info("cam-raw-dump: RAW[20-23]= %x %x %x %x\n", raw[20], raw[21], raw[22], raw[23]);
     }
+
+    // 用新假设的结构体去解析,试试看
+    struct cam_isp_hw_done_event_data_v2 *evt = (struct cam_isp_hw_done_event_data_v2 *)evt_ptr;
 
     if (!evt->num_handles) {
         return;
@@ -293,7 +291,7 @@ static long cam_kpm_control0(
     if (args[0] == 'c') {
 
         capture_status = 1;
-        dump_count = 0;  // 新增:每次武装时重置dump计数,方便重复测试
+        dump_count = 0;
 
         pr_info("cam-raw-dump: control0 armed, capture_status=%d\n", capture_status);
 
