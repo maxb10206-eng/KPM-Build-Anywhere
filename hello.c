@@ -16,7 +16,7 @@ KPM_DESCRIPTION("Camera RDI raw data extractor - size filtered");
 #define O_TRUNC  00001000
 
 #define FRAME_BUF_SIZE (2 * 1024 * 1024)
-#define SIZE_THRESHOLD  (3 * 1024 * 1024)   // 只抓超过512KB的buffer
+#define SIZE_THRESHOLD  (6 * 1024 * 1024)   // 只抓超过512KB的buffer
 
 static unsigned char cached_frame[FRAME_BUF_SIZE];
 static volatile size_t cached_len;
