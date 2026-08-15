@@ -9,15 +9,15 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI raw data extractor - arg1 typed filter");
+KPM_DESCRIPTION("Camera RDI raw data extractor - arg1 type filtered");
 
 #define O_WRONLY 00000001
 #define O_CREAT  00000100
 #define O_TRUNC  00001000
 
-#define FRAME_BUF_SIZE (8 * 1024 * 1024)   // 提到8MB,覆盖到6.4MB的样本
-#define TARGET_ARG1     0x2a161
-#define MIN_LEN_THRESHOLD (1 * 1024 * 1024) // 只要大于1MB
+#define FRAME_BUF_SIZE (8 * 1024 * 1024)   // 加大到8MB,能装下6.4MB那种大帧
+#define SIZE_THRESHOLD  (1 * 1024 * 1024)  // 只抓超过1MB的
+#define TARGET_ARG1     0x2a161            // 之前采样确认的"图像类"标识
 
 static unsigned char cached_frame[FRAME_BUF_SIZE];
 static volatile size_t cached_len;
@@ -33,8 +33,11 @@ static volatile char capture_status;   // 0=空闲 1=武装 2=已拷贝待写盘
 
 static volatile unsigned int cnt_hookA_before;
 static volatile unsigned int cnt_hookA_after;
-static volatile unsigned int cnt_matched_type;   // arg1匹配但len不够大的次数
+static volatile unsigned int cnt_wrong_arg1;
+static volatile unsigned int cnt_too_small;
 static volatile unsigned int cnt_copy_ok;
+
+static volatile size_t max_len_seen;
 
 
 static int is_err_ptr(void *ptr)
@@ -47,7 +50,7 @@ static void before_get_io_buf(hook_fargs3_t *args, void *udata)
 {
     cnt_hookA_before++;
     args->local.data0 = args->arg0;
-    args->local.data1 = args->arg1;
+    args->local.data1 = args->arg1;   // 记录arg1,after阶段要用来判断类型
 }
 
 
@@ -61,11 +64,11 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     int32_t buf_handle = (int32_t)args->local.data0;
     uint64_t raw_arg1 = (uint64_t)args->local.data1;
 
-    // ===== 核心过滤:类型必须匹配 =====
-    if (raw_arg1 != TARGET_ARG1)
+    if (!buf_handle || !p_cam_mem_get_cpu_buf)
         return;
 
-    if (!buf_handle || !p_cam_mem_get_cpu_buf)
+    // ===== 第一层过滤:类型必须匹配 =====
+    if (raw_arg1 != TARGET_ARG1)
         return;
 
     uintptr_t vaddr = 0;
@@ -77,9 +80,12 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     if (!vaddr || !len)
         return;
 
-    // ===== 二次过滤:必须够大,排除爬坡阶段的小尺寸样本 =====
-    if (len < MIN_LEN_THRESHOLD) {
-        cnt_matched_type++;
+    if (len > max_len_seen)
+        max_len_seen = len;
+
+    // ===== 第二层过滤:大小必须超过阈值,排除爬坡阶段小尺寸帧 =====
+    if (len < SIZE_THRESHOLD) {
+        cnt_too_small++;
         return;
     }
 
@@ -91,8 +97,8 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     cnt_copy_ok++;
     capture_status = 2;
 
-    pr_info("cam-raw-dump: TARGET frame copied! handle=%d len=%zu\n",
-            buf_handle, len);
+    pr_info("cam-raw-dump: TARGET frame copied! handle=%d arg1=%llx len=%zu\n",
+            buf_handle, raw_arg1, len);
 }
 
 
@@ -156,7 +162,7 @@ static int write_cached_frame_to_disk(void)
     );
 
     if (is_err_ptr(f)) {
-        pr_err("cam-raw-dump: open failed\n");
+        pr_err("cam-raw-dump: open failed in control0 context\n");
         return -1;
     }
 
@@ -202,9 +208,9 @@ static long cam_kpm_control0(
     } else if (args[0] == 's') {
 
         pr_info("cam-raw-dump: status=%d hookA_before=%u hookA_after=%u "
-                "matched_but_small=%u copy_ok=%u cached_len=%zu\n",
+                "too_small=%u copy_ok=%u cached_len=%zu max_len_seen=%zu\n",
                 capture_status, cnt_hookA_before, cnt_hookA_after,
-                cnt_matched_type, cnt_copy_ok, cached_len);
+                cnt_too_small, cnt_copy_ok, cached_len, max_len_seen);
 
         char buf[16] = "status=";
         buf[7] = '0' + capture_status;
