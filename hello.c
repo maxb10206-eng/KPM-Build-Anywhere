@@ -15,12 +15,13 @@ KPM_DESCRIPTION("Camera RDI raw data extractor - arg1 type filtered");
 #define O_CREAT  00000100
 #define O_TRUNC  00001000
 
-#define FRAME_BUF_SIZE (8 * 1024 * 1024)   // 加大到8MB,能装下6.4MB那种大帧
+#define FRAME_BUF_SIZE (2 * 1024 * 1024)   // 退回2MB,已验证安全上限
 #define SIZE_THRESHOLD  (1 * 1024 * 1024)  // 只抓超过1MB的
 #define TARGET_ARG1     0x2a161            // 之前采样确认的"图像类"标识
 
 static unsigned char cached_frame[FRAME_BUF_SIZE];
 static volatile size_t cached_len;
+static volatile size_t full_frame_len;   // 记录原始完整大小,即使被截断也知道真实值
 
 static void *(*p_filp_open)(const char *, int, unsigned short);
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
@@ -33,7 +34,6 @@ static volatile char capture_status;   // 0=空闲 1=武装 2=已拷贝待写盘
 
 static volatile unsigned int cnt_hookA_before;
 static volatile unsigned int cnt_hookA_after;
-static volatile unsigned int cnt_wrong_arg1;
 static volatile unsigned int cnt_too_small;
 static volatile unsigned int cnt_copy_ok;
 
@@ -50,7 +50,7 @@ static void before_get_io_buf(hook_fargs3_t *args, void *udata)
 {
     cnt_hookA_before++;
     args->local.data0 = args->arg0;
-    args->local.data1 = args->arg1;   // 记录arg1,after阶段要用来判断类型
+    args->local.data1 = args->arg1;
 }
 
 
@@ -67,7 +67,6 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     if (!buf_handle || !p_cam_mem_get_cpu_buf)
         return;
 
-    // ===== 第一层过滤:类型必须匹配 =====
     if (raw_arg1 != TARGET_ARG1)
         return;
 
@@ -83,22 +82,23 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     if (len > max_len_seen)
         max_len_seen = len;
 
-    // ===== 第二层过滤:大小必须超过阈值,排除爬坡阶段小尺寸帧 =====
     if (len < SIZE_THRESHOLD) {
         cnt_too_small++;
         return;
     }
 
+    // 超过缓冲区大小就截断,只拷贝能装下的部分
     size_t copy_len = len > FRAME_BUF_SIZE ? FRAME_BUF_SIZE : len;
 
     memcpy(cached_frame, (void *)vaddr, copy_len);
     cached_len = copy_len;
+    full_frame_len = len;
 
     cnt_copy_ok++;
     capture_status = 2;
 
-    pr_info("cam-raw-dump: TARGET frame copied! handle=%d arg1=%llx len=%zu\n",
-            buf_handle, raw_arg1, len);
+    pr_info("cam-raw-dump: TARGET frame copied! handle=%d arg1=%llx full_len=%zu copied_len=%zu\n",
+            buf_handle, raw_arg1, len, copy_len);
 }
 
 
@@ -171,7 +171,8 @@ static int write_cached_frame_to_disk(void)
 
     p_filp_close(f, NULL);
 
-    pr_info("cam-raw-dump: written=%ld to disk\n", written);
+    pr_info("cam-raw-dump: written=%ld to disk (full_frame_was=%zu)\n",
+            written, full_frame_len);
 
     return (written == (long)cached_len) ? 0 : -1;
 }
@@ -189,6 +190,7 @@ static long cam_kpm_control0(
 
         capture_status = 1;
         cached_len = 0;
+        full_frame_len = 0;
 
         pr_info("cam-raw-dump: control0 armed\n");
 
@@ -208,9 +210,9 @@ static long cam_kpm_control0(
     } else if (args[0] == 's') {
 
         pr_info("cam-raw-dump: status=%d hookA_before=%u hookA_after=%u "
-                "too_small=%u copy_ok=%u cached_len=%zu max_len_seen=%zu\n",
+                "too_small=%u copy_ok=%u cached_len=%zu full_frame_len=%zu max_len_seen=%zu\n",
                 capture_status, cnt_hookA_before, cnt_hookA_after,
-                cnt_too_small, cnt_copy_ok, cached_len, max_len_seen);
+                cnt_too_small, cnt_copy_ok, cached_len, full_frame_len, max_len_seen);
 
         char buf[16] = "status=";
         buf[7] = '0' + capture_status;
