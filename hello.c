@@ -9,7 +9,7 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI raw data extractor via cam_mem_get_io_buf hook");
+KPM_DESCRIPTION("Camera RDI raw data extractor - safe context split");
 
 #define O_WRONLY 00000001
 #define O_CREAT  00000100
@@ -17,7 +17,8 @@ KPM_DESCRIPTION("Camera RDI raw data extractor via cam_mem_get_io_buf hook");
 
 #define CHUNK_SIZE (2 * 1024 * 1024)
 
-static unsigned char chunk_buf[CHUNK_SIZE];
+static unsigned char cached_frame[CHUNK_SIZE];
+static volatile size_t cached_len;
 
 static void *(*p_filp_open)(const char *, int, unsigned short);
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
@@ -26,13 +27,11 @@ static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *);
 
 static unsigned long addr_get_io_buf;
 
-static volatile char capture_status;   // 0=空闲 1=武装 2=完成
+static volatile char capture_status;   // 0=空闲 1=武装 2=已拷贝待写盘 3=已写盘完成
 
 static volatile unsigned int cnt_hookA_before;
 static volatile unsigned int cnt_hookA_after;
-static volatile unsigned int cnt_write_attempt;
-static volatile unsigned int cnt_write_fail;
-static volatile unsigned int cnt_write_ok;
+static volatile unsigned int cnt_copy_ok;
 
 
 static int is_err_ptr(void *ptr)
@@ -42,14 +41,13 @@ static int is_err_ptr(void *ptr)
 
 
 // ===== Hook: cam_mem_get_io_buf =====
-// before阶段暂存 buf_handle(第一个参数)
+// 只做memcpy,不碰文件I/O,安全留在原子上下文
 static void before_get_io_buf(hook_fargs3_t *args, void *udata)
 {
     cnt_hookA_before++;
     args->local.data0 = args->arg0;
 }
 
-// after阶段:如果处于武装状态,直接拿这个buf_handle尝试抓取写文件
 static void after_get_io_buf(hook_fargs3_t *args, void *udata)
 {
     cnt_hookA_after++;
@@ -62,56 +60,25 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     if (!buf_handle || !p_cam_mem_get_cpu_buf)
         return;
 
-    cnt_write_attempt++;
-
     uintptr_t vaddr = 0;
     size_t len = 0;
 
-    if (p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len)) {
-        cnt_write_fail++;
+    if (p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len))
         return;
-    }
 
-    if (!vaddr || !len) {
-        cnt_write_fail++;
+    if (!vaddr || !len)
         return;
-    }
 
-    void *f = p_filp_open(
-        "/data/local/tmp/cam_frame.raw",
-        O_CREAT | O_WRONLY | O_TRUNC,
-        0644
-    );
+    size_t copy_len = len > CHUNK_SIZE ? CHUNK_SIZE : len;
 
-    if (is_err_ptr(f)) {
-        cnt_write_fail++;
-        pr_err("cam-raw-dump: open failed\n");
-        return;
-    }
+    memcpy(cached_frame, (void *)vaddr, copy_len);
+    cached_len = copy_len;
 
-    long long pos = 0;
-    size_t remain = len;
-    uintptr_t src = vaddr;
+    cnt_copy_ok++;
+    capture_status = 2;  // 拷贝完成,等待用户态触发写盘
 
-    while (remain) {
-        size_t n = remain > CHUNK_SIZE ? CHUNK_SIZE : remain;
-
-        memcpy(chunk_buf, (void *)src, n);
-
-        if (p_kernel_write(f, chunk_buf, n, &pos) < 0)
-            break;
-
-        src += n;
-        remain -= n;
-    }
-
-    p_filp_close(f, NULL);
-
-    cnt_write_ok++;
-    capture_status = 2;  // 抓到一次就停,避免连续覆盖
-
-    pr_info("cam-raw-dump: frame written, handle=%d vaddr=%lx len=%zu\n",
-            buf_handle, vaddr, len);
+    pr_info("cam-raw-dump: frame copied to buffer, handle=%d len=%zu\n",
+            buf_handle, copy_len);
 }
 
 
@@ -163,6 +130,34 @@ static long cam_kpm_init(
 }
 
 
+// 真正的写盘操作,只在这里(用户态触发的进程上下文)执行
+static int write_cached_frame_to_disk(void)
+{
+    if (cached_len == 0)
+        return -1;
+
+    void *f = p_filp_open(
+        "/data/local/tmp/cam_frame.raw",
+        O_CREAT | O_WRONLY | O_TRUNC,
+        0644
+    );
+
+    if (is_err_ptr(f)) {
+        pr_err("cam-raw-dump: open failed in control0 context\n");
+        return -1;
+    }
+
+    long long pos = 0;
+    long written = p_kernel_write(f, cached_frame, cached_len, &pos);
+
+    p_filp_close(f, NULL);
+
+    pr_info("cam-raw-dump: written=%ld to disk\n", written);
+
+    return (written == (long)cached_len) ? 0 : -1;
+}
+
+
 static long cam_kpm_control0(
     const char *args,
     char __user *out_msg,
@@ -174,32 +169,36 @@ static long cam_kpm_control0(
     if (args[0] == 'c') {
 
         capture_status = 1;
+        cached_len = 0;
 
-        pr_info("cam-raw-dump: control0 armed, capture_status=%d\n", capture_status);
+        pr_info("cam-raw-dump: control0 armed\n");
 
-        compat_copy_to_user(
-            out_msg,
-            "armed",
-            6
-        );
+        compat_copy_to_user(out_msg, "armed", 6);
+
+    } else if (args[0] == 'w') {
+
+        // 触发写盘,这里是进程上下文,安全
+        int rc = write_cached_frame_to_disk();
+
+        if (rc == 0) {
+            capture_status = 3;
+            compat_copy_to_user(out_msg, "write_ok", 9);
+        } else {
+            compat_copy_to_user(out_msg, "write_fail", 11);
+        }
 
     } else if (args[0] == 's') {
 
         pr_info("cam-raw-dump: status=%d hookA_before=%u hookA_after=%u "
-                "write_attempt=%u write_ok=%u write_fail=%u\n",
+                "copy_ok=%u cached_len=%zu\n",
                 capture_status, cnt_hookA_before, cnt_hookA_after,
-                cnt_write_attempt, cnt_write_ok, cnt_write_fail);
+                cnt_copy_ok, cached_len);
 
         char buf[16] = "status=";
-
         buf[7] = '0' + capture_status;
         buf[8] = '\0';
 
-        compat_copy_to_user(
-            out_msg,
-            buf,
-            9
-        );
+        compat_copy_to_user(out_msg, buf, 9);
     }
 
     return 0;
