@@ -4,18 +4,19 @@
 #include <linux/string.h>
 #include <kputils.h>
 #include <hook.h>
+#include <kpmalloc.h>
 
 KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI raw data extractor - dynamic alloc via kallsyms");
+KPM_DESCRIPTION("Camera RDI raw data extractor - correct kp_malloc usage");
 
 #define O_WRONLY 00000001
 #define O_CREAT  00000100
 #define O_TRUNC  00001000
 
-#define DYNAMIC_BUF_SIZE (8 * 1024 * 1024)   // 8MB,动态分配,不占.bss
+#define DYNAMIC_BUF_SIZE (8 * 1024 * 1024)
 #define SIZE_THRESHOLD (1 * 1024 * 1024)
 #define TARGET_ARG1 0x2a161
 
@@ -23,10 +24,8 @@ static void *(*p_filp_open)(const char *, int, unsigned short);
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
 static int (*p_filp_close)(void *, void *);
 static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *);
-static void *(*p_kp_malloc)(unsigned long size);
-static void (*p_kp_free)(void *mem);
 
-static unsigned char *dyn_buf;   // 指向动态分配的内存,不是静态数组
+static unsigned char *dyn_buf;   // 通过真正的kp_malloc(inline)分配
 static volatile size_t cached_len;
 
 static unsigned long addr_get_io_buf;
@@ -127,29 +126,19 @@ static long cam_kpm_init(
     addr_get_io_buf =
         kallsyms_lookup_name("cam_mem_get_io_buf");
 
-    // 关键新增:动态查找kp_malloc/kp_free,不再用extern直接声明
-    p_kp_malloc =
-        (void *)kallsyms_lookup_name("kp_malloc");
-
-    p_kp_free =
-        (void *)kallsyms_lookup_name("kp_free");
-
-    pr_info("cam-raw-dump: kp_malloc=%p kp_free=%p\n", p_kp_malloc, p_kp_free);
-
     if (!p_filp_open ||
         !p_kernel_write ||
         !p_filp_close ||
         !p_cam_mem_get_cpu_buf ||
-        !addr_get_io_buf ||
-        !p_kp_malloc ||
-        !p_kp_free) {
+        !addr_get_io_buf) {
 
         pr_err("cam-raw-dump: symbol lookup failed\n");
         return -1;
     }
 
-    // 用间接调用的方式分配堆内存,不占.bss
-    dyn_buf = p_kp_malloc(DYNAMIC_BUF_SIZE);
+    // 关键修正:直接调用kp_malloc,不查符号,不用函数指针
+    // 因为它是static inline,编译器会把实现代码直接嵌入本模块
+    dyn_buf = kp_malloc(DYNAMIC_BUF_SIZE);
 
     pr_info("cam-raw-dump: dyn_buf=%p size=%d\n", dyn_buf, DYNAMIC_BUF_SIZE);
 
@@ -165,6 +154,7 @@ static long cam_kpm_init(
         NULL)) {
 
         pr_err("cam-raw-dump: hook io buf failed\n");
+        kp_free(dyn_buf);
         return -1;
     }
 
@@ -253,8 +243,8 @@ static long cam_kpm_exit(void *reserved)
     if (addr_get_io_buf)
         unhook((void *)addr_get_io_buf);
 
-    if (dyn_buf && p_kp_free)
-        p_kp_free(dyn_buf);
+    if (dyn_buf)
+        kp_free(dyn_buf);
 
     pr_info("cam-raw-dump exit\n");
 
