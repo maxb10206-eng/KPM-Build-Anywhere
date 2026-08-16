@@ -9,19 +9,26 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI raw data extractor - arg1 type filtered");
+KPM_DESCRIPTION("Camera RDI raw data extractor - segmented buffer");
 
 #define O_WRONLY 00000001
 #define O_CREAT  00000100
 #define O_TRUNC  00001000
 
-#define FRAME_BUF_SIZE (2 * 1024 * 1024)   // 退回2MB,已验证安全上限
-#define SIZE_THRESHOLD  (1 * 1024 * 1024)  // 只抓超过1MB的
-#define TARGET_ARG1     0x2a161            // 之前采样确认的"图像类"标识
+#define SEG_SIZE (2 * 1024 * 1024)   // 单块2MB,已验证安全上限
+#define NUM_SEGS 4                    // 4块共8MB,够装下之前见过的最大帧(6.4MB)
+#define SIZE_THRESHOLD (1 * 1024 * 1024)
+#define TARGET_ARG1 0x2a161
 
-static unsigned char cached_frame[FRAME_BUF_SIZE];
+// 拆成4个独立的静态数组,而不是一个8MB大数组
+static unsigned char seg0[SEG_SIZE];
+static unsigned char seg1[SEG_SIZE];
+static unsigned char seg2[SEG_SIZE];
+static unsigned char seg3[SEG_SIZE];
+static unsigned char *segs[NUM_SEGS] = { seg0, seg1, seg2, seg3 };
+
 static volatile size_t cached_len;
-static volatile size_t full_frame_len;   // 记录原始完整大小,即使被截断也知道真实值
+static volatile size_t full_frame_len;
 
 static void *(*p_filp_open)(const char *, int, unsigned short);
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
@@ -30,11 +37,12 @@ static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *);
 
 static unsigned long addr_get_io_buf;
 
-static volatile char capture_status;   // 0=空闲 1=武装 2=已拷贝待写盘 3=已写盘完成
+static volatile char capture_status;
 
 static volatile unsigned int cnt_hookA_before;
 static volatile unsigned int cnt_hookA_after;
 static volatile unsigned int cnt_too_small;
+static volatile unsigned int cnt_too_big;
 static volatile unsigned int cnt_copy_ok;
 
 static volatile size_t max_len_seen;
@@ -87,18 +95,31 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
         return;
     }
 
-    // 超过缓冲区大小就截断,只拷贝能装下的部分
-    size_t copy_len = len > FRAME_BUF_SIZE ? FRAME_BUF_SIZE : len;
+    if (len > (size_t)(SEG_SIZE * NUM_SEGS)) {
+        cnt_too_big++;
+        return;
+    }
 
-    memcpy(cached_frame, (void *)vaddr, copy_len);
-    cached_len = copy_len;
+    // 分段拷贝到多个独立的2MB数组里
+    size_t remain = len;
+    uintptr_t src = vaddr;
+    int i;
+
+    for (i = 0; i < NUM_SEGS && remain > 0; i++) {
+        size_t n = remain > SEG_SIZE ? SEG_SIZE : remain;
+        memcpy(segs[i], (void *)src, n);
+        src += n;
+        remain -= n;
+    }
+
+    cached_len = len;
     full_frame_len = len;
 
     cnt_copy_ok++;
     capture_status = 2;
 
-    pr_info("cam-raw-dump: TARGET frame copied! handle=%d arg1=%llx full_len=%zu copied_len=%zu\n",
-            buf_handle, raw_arg1, len, copy_len);
+    pr_info("cam-raw-dump: TARGET frame copied! handle=%d arg1=%llx len=%zu\n",
+            buf_handle, raw_arg1, len);
 }
 
 
@@ -167,14 +188,27 @@ static int write_cached_frame_to_disk(void)
     }
 
     long long pos = 0;
-    long written = p_kernel_write(f, cached_frame, cached_len, &pos);
+    size_t remain = cached_len;
+    long total_written = 0;
+    int i;
+
+    for (i = 0; i < NUM_SEGS && remain > 0; i++) {
+        size_t n = remain > SEG_SIZE ? SEG_SIZE : remain;
+        long written = p_kernel_write(f, segs[i], n, &pos);
+
+        if (written < 0)
+            break;
+
+        total_written += written;
+        remain -= n;
+    }
 
     p_filp_close(f, NULL);
 
-    pr_info("cam-raw-dump: written=%ld to disk (full_frame_was=%zu)\n",
-            written, full_frame_len);
+    pr_info("cam-raw-dump: written=%ld to disk (target was %zu)\n",
+            total_written, cached_len);
 
-    return (written == (long)cached_len) ? 0 : -1;
+    return (total_written == (long)cached_len) ? 0 : -1;
 }
 
 
@@ -210,9 +244,9 @@ static long cam_kpm_control0(
     } else if (args[0] == 's') {
 
         pr_info("cam-raw-dump: status=%d hookA_before=%u hookA_after=%u "
-                "too_small=%u copy_ok=%u cached_len=%zu full_frame_len=%zu max_len_seen=%zu\n",
+                "too_small=%u too_big=%u copy_ok=%u cached_len=%zu max_len_seen=%zu\n",
                 capture_status, cnt_hookA_before, cnt_hookA_after,
-                cnt_too_small, cnt_copy_ok, cached_len, full_frame_len, max_len_seen);
+                cnt_too_small, cnt_too_big, cnt_copy_ok, cached_len, max_len_seen);
 
         char buf[16] = "status=";
         buf[7] = '0' + capture_status;
