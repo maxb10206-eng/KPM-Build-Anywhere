@@ -9,31 +9,25 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI raw data extractor - segmented buffer");
+KPM_DESCRIPTION("Camera RDI raw data extractor - dynamic alloc via kallsyms");
 
 #define O_WRONLY 00000001
 #define O_CREAT  00000100
 #define O_TRUNC  00001000
 
-#define SEG_SIZE (2 * 1024 * 1024)   // 单块2MB,已验证安全上限
-#define NUM_SEGS 4                    // 4块共8MB,够装下之前见过的最大帧(6.4MB)
+#define DYNAMIC_BUF_SIZE (8 * 1024 * 1024)   // 8MB,动态分配,不占.bss
 #define SIZE_THRESHOLD (1 * 1024 * 1024)
 #define TARGET_ARG1 0x2a161
-
-// 拆成4个独立的静态数组,而不是一个8MB大数组
-static unsigned char seg0[SEG_SIZE];
-static unsigned char seg1[SEG_SIZE];
-static unsigned char seg2[SEG_SIZE];
-static unsigned char seg3[SEG_SIZE];
-static unsigned char *segs[NUM_SEGS] = { seg0, seg1, seg2, seg3 };
-
-static volatile size_t cached_len;
-static volatile size_t full_frame_len;
 
 static void *(*p_filp_open)(const char *, int, unsigned short);
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
 static int (*p_filp_close)(void *, void *);
 static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *);
+static void *(*p_kp_malloc)(unsigned long size);
+static void (*p_kp_free)(void *mem);
+
+static unsigned char *dyn_buf;   // 指向动态分配的内存,不是静态数组
+static volatile size_t cached_len;
 
 static unsigned long addr_get_io_buf;
 
@@ -72,7 +66,7 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     int32_t buf_handle = (int32_t)args->local.data0;
     uint64_t raw_arg1 = (uint64_t)args->local.data1;
 
-    if (!buf_handle || !p_cam_mem_get_cpu_buf)
+    if (!buf_handle || !p_cam_mem_get_cpu_buf || !dyn_buf)
         return;
 
     if (raw_arg1 != TARGET_ARG1)
@@ -95,25 +89,13 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
         return;
     }
 
-    if (len > (size_t)(SEG_SIZE * NUM_SEGS)) {
+    if (len > DYNAMIC_BUF_SIZE) {
         cnt_too_big++;
         return;
     }
 
-    // 分段拷贝到多个独立的2MB数组里
-    size_t remain = len;
-    uintptr_t src = vaddr;
-    int i;
-
-    for (i = 0; i < NUM_SEGS && remain > 0; i++) {
-        size_t n = remain > SEG_SIZE ? SEG_SIZE : remain;
-        memcpy(segs[i], (void *)src, n);
-        src += n;
-        remain -= n;
-    }
-
+    memcpy(dyn_buf, (void *)vaddr, len);
     cached_len = len;
-    full_frame_len = len;
 
     cnt_copy_ok++;
     capture_status = 2;
@@ -145,13 +127,34 @@ static long cam_kpm_init(
     addr_get_io_buf =
         kallsyms_lookup_name("cam_mem_get_io_buf");
 
+    // 关键新增:动态查找kp_malloc/kp_free,不再用extern直接声明
+    p_kp_malloc =
+        (void *)kallsyms_lookup_name("kp_malloc");
+
+    p_kp_free =
+        (void *)kallsyms_lookup_name("kp_free");
+
+    pr_info("cam-raw-dump: kp_malloc=%p kp_free=%p\n", p_kp_malloc, p_kp_free);
+
     if (!p_filp_open ||
         !p_kernel_write ||
         !p_filp_close ||
         !p_cam_mem_get_cpu_buf ||
-        !addr_get_io_buf) {
+        !addr_get_io_buf ||
+        !p_kp_malloc ||
+        !p_kp_free) {
 
         pr_err("cam-raw-dump: symbol lookup failed\n");
+        return -1;
+    }
+
+    // 用间接调用的方式分配堆内存,不占.bss
+    dyn_buf = p_kp_malloc(DYNAMIC_BUF_SIZE);
+
+    pr_info("cam-raw-dump: dyn_buf=%p size=%d\n", dyn_buf, DYNAMIC_BUF_SIZE);
+
+    if (!dyn_buf) {
+        pr_err("cam-raw-dump: kp_malloc failed\n");
         return -1;
     }
 
@@ -173,7 +176,7 @@ static long cam_kpm_init(
 
 static int write_cached_frame_to_disk(void)
 {
-    if (cached_len == 0)
+    if (cached_len == 0 || !dyn_buf)
         return -1;
 
     void *f = p_filp_open(
@@ -188,27 +191,14 @@ static int write_cached_frame_to_disk(void)
     }
 
     long long pos = 0;
-    size_t remain = cached_len;
-    long total_written = 0;
-    int i;
-
-    for (i = 0; i < NUM_SEGS && remain > 0; i++) {
-        size_t n = remain > SEG_SIZE ? SEG_SIZE : remain;
-        long written = p_kernel_write(f, segs[i], n, &pos);
-
-        if (written < 0)
-            break;
-
-        total_written += written;
-        remain -= n;
-    }
+    long written = p_kernel_write(f, dyn_buf, cached_len, &pos);
 
     p_filp_close(f, NULL);
 
     pr_info("cam-raw-dump: written=%ld to disk (target was %zu)\n",
-            total_written, cached_len);
+            written, cached_len);
 
-    return (total_written == (long)cached_len) ? 0 : -1;
+    return (written == (long)cached_len) ? 0 : -1;
 }
 
 
@@ -224,7 +214,6 @@ static long cam_kpm_control0(
 
         capture_status = 1;
         cached_len = 0;
-        full_frame_len = 0;
 
         pr_info("cam-raw-dump: control0 armed\n");
 
@@ -263,6 +252,9 @@ static long cam_kpm_exit(void *reserved)
 {
     if (addr_get_io_buf)
         unhook((void *)addr_get_io_buf);
+
+    if (dyn_buf && p_kp_free)
+        p_kp_free(dyn_buf);
 
     pr_info("cam-raw-dump exit\n");
 
