@@ -9,34 +9,32 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI raw data extractor - vmalloc based");
+KPM_DESCRIPTION("Camera RDI raw data extractor - arg1 type filtered");
 
 #define O_WRONLY 00000001
 #define O_CREAT  00000100
 #define O_TRUNC  00001000
 
-#define DYNAMIC_BUF_SIZE (8 * 1024 * 1024)
-#define SIZE_THRESHOLD (1 * 1024 * 1024)
-#define TARGET_ARG1 0x2a161
+#define FRAME_BUF_SIZE (2 * 1024 * 1024)   // 退回2MB,已验证安全上限
+#define SIZE_THRESHOLD  (1 * 1024 * 1024)  // 只抓超过1MB的
+#define TARGET_ARG1     0x2a161            // 之前采样确认的"图像类"标识
+
+static unsigned char cached_frame[FRAME_BUF_SIZE];
+static volatile size_t cached_len;
+static volatile size_t full_frame_len;   // 记录原始完整大小,即使被截断也知道真实值
 
 static void *(*p_filp_open)(const char *, int, unsigned short);
 static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
 static int (*p_filp_close)(void *, void *);
 static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *);
-static void *(*p_vmalloc)(unsigned long size);
-static void (*p_vfree)(const void *addr);
-
-static unsigned char *dyn_buf;
-static volatile size_t cached_len;
 
 static unsigned long addr_get_io_buf;
 
-static volatile char capture_status;
+static volatile char capture_status;   // 0=空闲 1=武装 2=已拷贝待写盘 3=已写盘完成
 
 static volatile unsigned int cnt_hookA_before;
 static volatile unsigned int cnt_hookA_after;
 static volatile unsigned int cnt_too_small;
-static volatile unsigned int cnt_too_big;
 static volatile unsigned int cnt_copy_ok;
 
 static volatile size_t max_len_seen;
@@ -66,7 +64,7 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
     int32_t buf_handle = (int32_t)args->local.data0;
     uint64_t raw_arg1 = (uint64_t)args->local.data1;
 
-    if (!buf_handle || !p_cam_mem_get_cpu_buf || !dyn_buf)
+    if (!buf_handle || !p_cam_mem_get_cpu_buf)
         return;
 
     if (raw_arg1 != TARGET_ARG1)
@@ -89,19 +87,18 @@ static void after_get_io_buf(hook_fargs3_t *args, void *udata)
         return;
     }
 
-    if (len > DYNAMIC_BUF_SIZE) {
-        cnt_too_big++;
-        return;
-    }
+    // 超过缓冲区大小就截断,只拷贝能装下的部分
+    size_t copy_len = len > FRAME_BUF_SIZE ? FRAME_BUF_SIZE : len;
 
-    memcpy(dyn_buf, (void *)vaddr, len);
-    cached_len = len;
+    memcpy(cached_frame, (void *)vaddr, copy_len);
+    cached_len = copy_len;
+    full_frame_len = len;
 
     cnt_copy_ok++;
     capture_status = 2;
 
-    pr_info("cam-raw-dump: TARGET frame copied! handle=%d arg1=%llx len=%zu\n",
-            buf_handle, raw_arg1, len);
+    pr_info("cam-raw-dump: TARGET frame copied! handle=%d arg1=%llx full_len=%zu copied_len=%zu\n",
+            buf_handle, raw_arg1, len, copy_len);
 }
 
 
@@ -127,33 +124,13 @@ static long cam_kpm_init(
     addr_get_io_buf =
         kallsyms_lookup_name("cam_mem_get_io_buf");
 
-    // 换成标准内核vmalloc/vfree,而不是kp_malloc
-    p_vmalloc =
-        (void *)kallsyms_lookup_name("vmalloc");
-
-    p_vfree =
-        (void *)kallsyms_lookup_name("vfree");
-
-    pr_info("cam-raw-dump: vmalloc=%p vfree=%p\n", p_vmalloc, p_vfree);
-
     if (!p_filp_open ||
         !p_kernel_write ||
         !p_filp_close ||
         !p_cam_mem_get_cpu_buf ||
-        !addr_get_io_buf ||
-        !p_vmalloc ||
-        !p_vfree) {
+        !addr_get_io_buf) {
 
         pr_err("cam-raw-dump: symbol lookup failed\n");
-        return -1;
-    }
-
-    dyn_buf = p_vmalloc(DYNAMIC_BUF_SIZE);
-
-    pr_info("cam-raw-dump: dyn_buf=%p size=%d\n", dyn_buf, DYNAMIC_BUF_SIZE);
-
-    if (!dyn_buf) {
-        pr_err("cam-raw-dump: vmalloc failed\n");
         return -1;
     }
 
@@ -175,7 +152,7 @@ static long cam_kpm_init(
 
 static int write_cached_frame_to_disk(void)
 {
-    if (cached_len == 0 || !dyn_buf)
+    if (cached_len == 0)
         return -1;
 
     void *f = p_filp_open(
@@ -190,12 +167,12 @@ static int write_cached_frame_to_disk(void)
     }
 
     long long pos = 0;
-    long written = p_kernel_write(f, dyn_buf, cached_len, &pos);
+    long written = p_kernel_write(f, cached_frame, cached_len, &pos);
 
     p_filp_close(f, NULL);
 
-    pr_info("cam-raw-dump: written=%ld to disk (target was %zu)\n",
-            written, cached_len);
+    pr_info("cam-raw-dump: written=%ld to disk (full_frame_was=%zu)\n",
+            written, full_frame_len);
 
     return (written == (long)cached_len) ? 0 : -1;
 }
@@ -213,6 +190,7 @@ static long cam_kpm_control0(
 
         capture_status = 1;
         cached_len = 0;
+        full_frame_len = 0;
 
         pr_info("cam-raw-dump: control0 armed\n");
 
@@ -232,9 +210,9 @@ static long cam_kpm_control0(
     } else if (args[0] == 's') {
 
         pr_info("cam-raw-dump: status=%d hookA_before=%u hookA_after=%u "
-                "too_small=%u too_big=%u copy_ok=%u cached_len=%zu max_len_seen=%zu\n",
+                "too_small=%u copy_ok=%u cached_len=%zu full_frame_len=%zu max_len_seen=%zu\n",
                 capture_status, cnt_hookA_before, cnt_hookA_after,
-                cnt_too_small, cnt_too_big, cnt_copy_ok, cached_len, max_len_seen);
+                cnt_too_small, cnt_copy_ok, cached_len, full_frame_len, max_len_seen);
 
         char buf[16] = "status=";
         buf[7] = '0' + capture_status;
@@ -251,9 +229,6 @@ static long cam_kpm_exit(void *reserved)
 {
     if (addr_get_io_buf)
         unhook((void *)addr_get_io_buf);
-
-    if (dyn_buf && p_vfree)
-        p_vfree(dyn_buf);
 
     pr_info("cam-raw-dump exit\n");
 
