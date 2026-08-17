@@ -9,93 +9,55 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI raw data extractor - size range only, no arg1 dependency");
+KPM_DESCRIPTION("RDI resource_type discovery - raw dump diagnostic");
 
-#define O_WRONLY 00000001
-#define O_CREAT  00000100
-#define O_TRUNC  00001000
+static unsigned long addr_add_io_buffers;
 
-#define DYNAMIC_BUF_SIZE (8 * 1024 * 1024)
-#define SIZE_MIN (1 * 1024 * 1024)     // 下限1MB,排除小的统计/元数据buffer
-#define SIZE_MAX (8 * 1024 * 1024)     // 上限8MB,不能超过分配的buffer大小
+static volatile char capture_status;   // 0=空闲 1=诊断中
+static volatile unsigned int cnt_hook_before;
+static volatile int dump_count;
 
-static void *(*p_filp_open)(const char *, int, unsigned short);
-static long (*p_kernel_write)(void *, const void *, unsigned long, long long *);
-static int (*p_filp_close)(void *, void *);
-static int (*p_cam_mem_get_cpu_buf)(int32_t, uintptr_t *, size_t *);
-static void *(*p_vmalloc)(unsigned long size);
-static void (*p_vfree)(const void *addr);
-
-static unsigned char *dyn_buf;
-static volatile size_t cached_len;
-
-static unsigned long addr_get_io_buf;
-
-static volatile char capture_status;
-
-static volatile unsigned int cnt_hookA_before;
-static volatile unsigned int cnt_hookA_after;
-static volatile unsigned int cnt_out_of_range;
-static volatile unsigned int cnt_copy_ok;
-
-static volatile size_t max_len_seen;
-static volatile uint64_t last_matched_arg1;   // 记录这次实际命中的arg1是多少,供参考
+#define MAX_DUMPS 3
 
 
-static int is_err_ptr(void *ptr)
+static void before_add_io_buffers(hook_fargs3_t *args, void *udata)
 {
-    return (unsigned long)ptr >= (unsigned long)-4095;
-}
-
-
-static void before_get_io_buf(hook_fargs3_t *args, void *udata)
-{
-    cnt_hookA_before++;
-    args->local.data0 = args->arg0;
-    args->local.data1 = args->arg1;
-}
-
-
-static void after_get_io_buf(hook_fargs3_t *args, void *udata)
-{
-    cnt_hookA_after++;
+    cnt_hook_before++;
 
     if (capture_status != 1)
         return;
 
-    int32_t buf_handle = (int32_t)args->local.data0;
-    uint64_t raw_arg1 = (uint64_t)args->local.data1;
-
-    if (!buf_handle || !p_cam_mem_get_cpu_buf || !dyn_buf)
+    if (dump_count >= MAX_DUMPS)
         return;
 
-    uintptr_t vaddr = 0;
-    size_t len = 0;
+    dump_count++;
 
-    if (p_cam_mem_get_cpu_buf(buf_handle, &vaddr, &len))
-        return;
+    void *prepare = (void *)args->arg2;   // 第3个参数(0-indexed arg2)
 
-    if (!vaddr || !len)
-        return;
-
-    if (len > max_len_seen)
-        max_len_seen = len;
-
-    // ===== 只按大小区间过滤,不再依赖arg1 =====
-    if (len < SIZE_MIN || len > SIZE_MAX) {
-        cnt_out_of_range++;
+    if (!prepare) {
+        pr_info("cam-raw-dump: DUMP#%d prepare is NULL\n", dump_count);
         return;
     }
 
-    memcpy(dyn_buf, (void *)vaddr, len);
-    cached_len = len;
-    last_matched_arg1 = raw_arg1;
+    pr_info("cam-raw-dump: DUMP#%d prepare=%p\n", dump_count, prepare);
 
-    cnt_copy_ok++;
-    capture_status = 2;
+    // 原样dump *prepare 前256字节(32个uint64),不假设任何字段布局
+    uint64_t *raw = (uint64_t *)prepare;
+    int i;
 
-    pr_info("cam-raw-dump: MATCHED by size! handle=%d arg1=%llx len=%zu\n",
-            buf_handle, raw_arg1, len);
+    for (i = 0; i < 32; i += 4) {
+        pr_info("cam-raw-dump: prep[%02d-%02d] = %llx %llx %llx %llx\n",
+                i, i+3, raw[i], raw[i+1], raw[i+2], raw[i+3]);
+    }
+
+    // 找出看起来像内核指针的值(高位是0xffffff开头),这些很可能是packet等结构体的地址
+    pr_info("cam-raw-dump: DUMP#%d scanning for pointer-like values...\n", dump_count);
+    for (i = 0; i < 32; i++) {
+        uint64_t v = raw[i];
+        if ((v & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) {
+            pr_info("cam-raw-dump: prep[%d] LOOKS LIKE KERNEL PTR = %llx\n", i, v);
+        }
+    }
 }
 
 
@@ -106,89 +68,29 @@ static long cam_kpm_init(
 {
     pr_info("cam-raw-dump: symbol lookup\n");
 
-    p_filp_open =
-        (void *)kallsyms_lookup_name("filp_open");
+    addr_add_io_buffers =
+        kallsyms_lookup_name("cam_isp_add_io_buffers");
 
-    p_kernel_write =
-        (void *)kallsyms_lookup_name("kernel_write");
+    pr_info("cam-raw-dump: cam_isp_add_io_buffers addr=%lx\n", addr_add_io_buffers);
 
-    p_filp_close =
-        (void *)kallsyms_lookup_name("filp_close");
-
-    p_cam_mem_get_cpu_buf =
-        (void *)kallsyms_lookup_name("cam_mem_get_cpu_buf");
-
-    addr_get_io_buf =
-        kallsyms_lookup_name("cam_mem_get_io_buf");
-
-    p_vmalloc =
-        (void *)kallsyms_lookup_name("vmalloc");
-
-    p_vfree =
-        (void *)kallsyms_lookup_name("vfree");
-
-    if (!p_filp_open ||
-        !p_kernel_write ||
-        !p_filp_close ||
-        !p_cam_mem_get_cpu_buf ||
-        !addr_get_io_buf ||
-        !p_vmalloc ||
-        !p_vfree) {
-
+    if (!addr_add_io_buffers) {
         pr_err("cam-raw-dump: symbol lookup failed\n");
         return -1;
     }
 
-    dyn_buf = p_vmalloc(DYNAMIC_BUF_SIZE);
-
-    pr_info("cam-raw-dump: dyn_buf=%p size=%d\n", dyn_buf, DYNAMIC_BUF_SIZE);
-
-    if (!dyn_buf) {
-        pr_err("cam-raw-dump: vmalloc failed\n");
-        return -1;
-    }
-
     if (hook_wrap3(
-        (void *)addr_get_io_buf,
-        before_get_io_buf,
-        after_get_io_buf,
+        (void *)addr_add_io_buffers,
+        before_add_io_buffers,
+        NULL,
         NULL)) {
 
-        pr_err("cam-raw-dump: hook io buf failed\n");
+        pr_err("cam-raw-dump: hook add_io_buffers failed\n");
         return -1;
     }
 
     pr_info("cam-raw-dump: init ok\n");
 
     return 0;
-}
-
-
-static int write_cached_frame_to_disk(void)
-{
-    if (cached_len == 0 || !dyn_buf)
-        return -1;
-
-    void *f = p_filp_open(
-        "/data/local/tmp/cam_frame.raw",
-        O_CREAT | O_WRONLY | O_TRUNC,
-        0644
-    );
-
-    if (is_err_ptr(f)) {
-        pr_err("cam-raw-dump: open failed in control0 context\n");
-        return -1;
-    }
-
-    long long pos = 0;
-    long written = p_kernel_write(f, dyn_buf, cached_len, &pos);
-
-    p_filp_close(f, NULL);
-
-    pr_info("cam-raw-dump: written=%ld to disk (target was %zu)\n",
-            written, cached_len);
-
-    return (written == (long)cached_len) ? 0 : -1;
 }
 
 
@@ -203,35 +105,20 @@ static long cam_kpm_control0(
     if (args[0] == 'c') {
 
         capture_status = 1;
-        cached_len = 0;
+        dump_count = 0;
 
-        pr_info("cam-raw-dump: control0 armed\n");
+        pr_info("cam-raw-dump: control0 armed, diagnostic dump started\n");
 
         compat_copy_to_user(out_msg, "armed", 6);
 
-    } else if (args[0] == 'w') {
-
-        int rc = write_cached_frame_to_disk();
-
-        if (rc == 0) {
-            capture_status = 3;
-            compat_copy_to_user(out_msg, "write_ok", 9);
-        } else {
-            compat_copy_to_user(out_msg, "write_fail", 11);
-        }
-
     } else if (args[0] == 's') {
 
-        pr_info("cam-raw-dump: status=%d hookA_before=%u hookA_after=%u "
-                "out_of_range=%u copy_ok=%u cached_len=%zu max_len_seen=%zu last_arg1=%llx\n",
-                capture_status, cnt_hookA_before, cnt_hookA_after,
-                cnt_out_of_range, cnt_copy_ok, cached_len, max_len_seen, last_matched_arg1);
+        capture_status = 0;
 
-        char buf[16] = "status=";
-        buf[7] = '0' + capture_status;
-        buf[8] = '\0';
+        pr_info("cam-raw-dump: stopped, hook_before=%u dump_count=%d\n",
+                cnt_hook_before, dump_count);
 
-        compat_copy_to_user(out_msg, buf, 9);
+        compat_copy_to_user(out_msg, "stopped", 8);
     }
 
     return 0;
@@ -240,11 +127,8 @@ static long cam_kpm_control0(
 
 static long cam_kpm_exit(void *reserved)
 {
-    if (addr_get_io_buf)
-        unhook((void *)addr_get_io_buf);
-
-    if (dyn_buf && p_vfree)
-        p_vfree(dyn_buf);
+    if (addr_add_io_buffers)
+        unhook((void *)addr_add_io_buffers);
 
     pr_info("cam-raw-dump exit\n");
 
