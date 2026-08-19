@@ -5,23 +5,21 @@
 #include <hook.h>
 
 KPM_NAME("cam-raw-dump");
-KPM_VERSION("1.2.0");
+KPM_VERSION("1.3.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI CPU buffer probe");
-
-/*
- * Verified from the OnePlus camera-kernel source.
- * These are ABI mirrors, not guessed layouts.
- */
+KPM_DESCRIPTION("RDI dma-buf probe");
 
 #define CAM_PACKET_MAX_PLANES 3
 #define CAM_BUF_OUTPUT 2
 
-#define CAM_ISP_IFE_OUT_RES_RDI_0 0x3006
-#define CAM_ISP_IFE_OUT_RES_RDI_1 0x3007
-#define CAM_ISP_IFE_OUT_RES_RDI_2 0x3008
-#define CAM_ISP_IFE_OUT_RES_RDI_3 0x3009
+#define RDI_0 0x3006
+#define RDI_1 0x3007
+#define RDI_2 0x3008
+#define RDI_3 0x3009
+
+#define HANDLE_IDX_MASK 0x7fff
+#define HANDLE_FD_SHIFT 16
 
 struct kp_cam_packet_header {
 	unsigned int op_code;
@@ -81,12 +79,11 @@ struct kp_cam_buf_io_cfg {
 };
 
 static unsigned long addr_prepare;
-static unsigned long addr_get_cpu_buf;
+static unsigned long addr_dma_buf_get;
+static unsigned long addr_dma_buf_put;
 
-static int (*get_cpu_buf)(
-	int,
-	unsigned long *,
-	unsigned long *);
+static void *(*get_dma_buf)(int fd);
+static void (*put_dma_buf)(void *dmabuf);
 
 static volatile int armed;
 static volatile unsigned int hook_count;
@@ -99,23 +96,22 @@ static void before_prepare(hook_fargs2_t *args, void *udata)
 	struct kp_cam_packet *packet;
 	struct kp_cam_buf_io_cfg *io_cfg;
 	unsigned int i, plane;
-	unsigned long vaddr;
-	unsigned long len;
-	int rc;
+	unsigned int handle;
+	unsigned int idx;
+	unsigned int fd;
+	void *dmabuf;
 
 	hook_count++;
 
 	if (!armed || rdi_count >= MAX_RDI_LOG)
 		return;
 
-	/*
-	 * cam_hw_prepare_update_args->packet
-	 * is the first field, so arg1 points to the struct and
-	 * its first machine word is the packet pointer.
-	 */
 	packet = *(struct kp_cam_packet **)args->arg1;
-
 	if (!packet)
+		return;
+
+	if (!packet->num_io_configs ||
+	    packet->num_io_configs > 64)
 		return;
 
 	io_cfg = (struct kp_cam_buf_io_cfg *)(
@@ -126,8 +122,8 @@ static void before_prepare(hook_fargs2_t *args, void *udata)
 		if (io_cfg[i].direction != CAM_BUF_OUTPUT)
 			continue;
 
-		if (io_cfg[i].resource_type < CAM_ISP_IFE_OUT_RES_RDI_0 ||
-		    io_cfg[i].resource_type > CAM_ISP_IFE_OUT_RES_RDI_3)
+		if (io_cfg[i].resource_type < RDI_0 ||
+		    io_cfg[i].resource_type > RDI_3)
 			continue;
 
 		rdi_count++;
@@ -144,24 +140,39 @@ static void before_prepare(hook_fargs2_t *args, void *udata)
 			if (!io_cfg[i].mem_handle[plane])
 				break;
 
-			vaddr = 0;
-			len = 0;
+			handle = (unsigned int)io_cfg[i].mem_handle[plane];
 
-			rc = get_cpu_buf(
-				io_cfg[i].mem_handle[plane],
-				&vaddr,
-				&len);
+			idx = handle & HANDLE_IDX_MASK;
+			fd = handle >> HANDLE_FD_SHIFT;
 
 			pr_info(
 				"cam-raw-dump: RDI=0x%x plane=%u "
-				"mem=0x%x rc=%d vaddr=%lx len=%lu\n",
+				"mem=0x%x idx=%u fd=%u\n",
 				io_cfg[i].resource_type,
 				plane,
-				io_cfg[i].mem_handle[plane],
-				rc,
-				vaddr,
-				len);
+				handle,
+				idx,
+				fd);
+
+			if (!get_dma_buf)
+				continue;
+
+			dmabuf = get_dma_buf((int)fd);
+
+			pr_info(
+				"cam-raw-dump: RDI=0x%x plane=%u "
+				"fd=%u dma_buf=%p\n",
+				io_cfg[i].resource_type,
+				plane,
+				fd,
+				dmabuf);
+
+			if (dmabuf && put_dma_buf)
+				put_dma_buf(dmabuf);
 		}
+
+		if (rdi_count >= MAX_RDI_LOG)
+			break;
 	}
 }
 
@@ -174,21 +185,28 @@ static long cam_kpm_init(
 		kallsyms_lookup_name(
 			"cam_ife_mgr_prepare_hw_update");
 
-	addr_get_cpu_buf =
-		kallsyms_lookup_name(
-			"cam_mem_get_cpu_buf");
+	addr_dma_buf_get =
+		kallsyms_lookup_name("dma_buf_get");
+
+	addr_dma_buf_put =
+		kallsyms_lookup_name("dma_buf_put");
 
 	pr_info(
-		"cam-raw-dump: prepare=%lx cpu_buf=%lx\n",
+		"cam-raw-dump: prepare=%lx dma_buf_get=%lx dma_buf_put=%lx\n",
 		addr_prepare,
-		addr_get_cpu_buf);
+		addr_dma_buf_get,
+		addr_dma_buf_put);
 
-	if (!addr_prepare || !addr_get_cpu_buf)
+	if (!addr_prepare ||
+	    !addr_dma_buf_get ||
+	    !addr_dma_buf_put)
 		return -1;
 
-	get_cpu_buf =
-		(int (*)(int, unsigned long *, unsigned long *))
-		(void *)addr_get_cpu_buf;
+	get_dma_buf =
+		(void *(*)(int))(void *)addr_dma_buf_get;
+
+	put_dma_buf =
+		(void (*)(void *))(void *)addr_dma_buf_put;
 
 	if (hook_wrap2(
 		(void *)addr_prepare,
