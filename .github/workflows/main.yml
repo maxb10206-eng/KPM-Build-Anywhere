@@ -1,3 +1,4 @@
+```yaml
 name: Build KPM Module
 
 on:
@@ -6,13 +7,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - name: 获取源代码
         uses: actions/checkout@v4
 
       - name: 获取 KernelPatch 源码
         run: |
-          git clone --depth 1 --branch 0.11.3 https://github.com/bmax121/KernelPatch.git ../KernelPatch-0.11.3
+          git clone --depth 1 --branch 0.11.3 \
+            https://github.com/bmax121/KernelPatch.git \
+            ../KernelPatch-0.11.3
+
+      - name: 获取 OnePlus Kernel 源码
+        run: |
+          git clone --depth 1 \
+            KERNEL_REPO_URL \
+            ../android_kernel_modules_and_devicetree_oneplus_sm8450-oneplus-sm8450_b_16.0_oneplus_10_pro
 
       - name: 配置 Android NDK 环境
         uses: nttld/setup-ndk@v1
@@ -23,7 +33,7 @@ jobs:
       - name: 编译 KPM
         run: |
           export NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
-          make NDK_PATH=$NDK_PATH
+          make NDK_PATH="$NDK_PATH"
 
       - name: 打包并上传成品
         uses: actions/upload-artifact@v4
@@ -33,3 +43,4 @@ jobs:
             ./*.kpm
             out/*.kpm
             build/*.kpm
+```
