@@ -1,7 +1,6 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <linux/string.h>
 #include <kputils.h>
 #include <hook.h>
 
@@ -9,12 +8,10 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.3.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI0 first-frame capture");
+KPM_DESCRIPTION("RDI0 first-frame dump");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
-
-#define MAX_CAPTURE_SIZE (64UL * 1024 * 1024)
 
 struct dma_buf;
 struct file;
@@ -87,7 +84,6 @@ static unsigned long addr_begin_cpu;
 static unsigned long addr_end_cpu;
 static unsigned long addr_vmap;
 static unsigned long addr_vunmap;
-
 static unsigned long addr_filp_open;
 static unsigned long addr_filp_close;
 static unsigned long addr_kernel_write;
@@ -96,12 +92,10 @@ static struct dma_buf *(*kp_dma_buf_get)(int fd);
 static void (*kp_dma_buf_put)(struct dma_buf *buf);
 
 static int (*kp_begin_cpu)(
-	struct dma_buf *buf,
-	int direction);
+	struct dma_buf *buf, int direction);
 
 static int (*kp_end_cpu)(
-	struct dma_buf *buf,
-	int direction);
+	struct dma_buf *buf, int direction);
 
 static void *(*kp_vmap)(
 	struct dma_buf *buf);
@@ -128,10 +122,32 @@ static long (*kp_kernel_write)(
 static volatile int armed;
 static volatile int captured;
 
-static void *capture_buf;
+static struct dma_buf *capture_buf;
+static void *capture_vaddr;
 static unsigned long capture_len;
+static unsigned long capture_request;
 
-static volatile unsigned int hook_count;
+static void release_capture(void)
+{
+	if (capture_buf && capture_vaddr)
+		kp_vunmap(
+			capture_buf,
+			capture_vaddr);
+
+	capture_vaddr = NULL;
+
+	if (capture_buf)
+		kp_end_cpu(
+			capture_buf,
+			0);
+
+	if (capture_buf)
+		kp_dma_buf_put(
+			capture_buf);
+
+	capture_buf = NULL;
+	capture_len = 0;
+}
 
 static void write_capture(void)
 {
@@ -139,17 +155,9 @@ static void write_capture(void)
 	long long pos = 0;
 	long rc;
 
-	if (!capture_buf || !capture_len) {
+	if (!capture_buf || !capture_vaddr || !capture_len) {
 		pr_info(
-			"cam-raw-dump: no captured buffer\n");
-		return;
-	}
-
-	if (!kp_filp_open ||
-	    !kp_filp_close ||
-	    !kp_kernel_write) {
-		pr_info(
-			"cam-raw-dump: file API unavailable\n");
+			"cam-raw-dump: no capture\n");
 		return;
 	}
 
@@ -158,25 +166,27 @@ static void write_capture(void)
 		1 | 64 | 512,
 		0600);
 
-	if (IS_ERR(file)) {
+	if (!file) {
 		pr_info(
-			"cam-raw-dump: filp_open failed\n");
+			"cam-raw-dump: filp_open returned NULL\n");
 		return;
 	}
 
 	rc = kp_kernel_write(
 		file,
-		capture_buf,
+		capture_vaddr,
 		capture_len,
 		&pos);
 
 	pr_info(
-		"cam-raw-dump: write rc=%ld "
-		"expected=%lu\n",
+		"cam-raw-dump: write rc=%ld len=%lu req=%lu\n",
 		rc,
-		capture_len);
+		capture_len,
+		capture_request);
 
-	kp_filp_close(file, NULL);
+	kp_filp_close(
+		file,
+		NULL);
 }
 
 static void before_prepare(
@@ -188,16 +198,12 @@ static void before_prepare(
 
 	struct dma_buf *buf;
 	void *vaddr;
-	void *dst;
 
 	unsigned int i;
 	unsigned int handle;
 	unsigned int fd;
 
-	unsigned long len;
 	int rc;
-
-	hook_count++;
 
 	if (!armed || captured)
 		return;
@@ -234,130 +240,108 @@ static void before_prepare(
 
 		fd = handle >> 16;
 
-		pr_info(
-			"cam-raw-dump: capture req=%llu "
-			"mem=0x%x fd=%u\n",
-			packet->header.request_id,
-			handle,
-			fd);
-
-		buf = kp_dma_buf_get((int)fd);
+		buf =
+			kp_dma_buf_get(
+				(int)fd);
 
 		if (!buf) {
 			pr_info(
-				"cam-raw-dump: "
-				"dma_buf_get failed\n");
+				"cam-raw-dump: dma_buf_get failed "
+				"fd=%u\n",
+				fd);
 			return;
 		}
 
-		rc = kp_begin_cpu(buf, 0);
+		rc =
+			kp_begin_cpu(
+				buf,
+				0);
 
 		if (rc) {
 			pr_info(
-				"cam-raw-dump: "
-				"begin_cpu rc=%d\n",
+				"cam-raw-dump: begin_cpu rc=%d\n",
 				rc);
 
-			kp_dma_buf_put(buf);
+			kp_dma_buf_put(
+				buf);
+
 			return;
 		}
 
-		/*
-		 * dma_buf_vmap() 已经在 1.3.2
-		 * 成功验证过。
-		 */
-		vaddr = kp_vmap(buf);
+		vaddr =
+			kp_vmap(
+				buf);
 
 		if (!vaddr) {
 			pr_info(
-				"cam-raw-dump: "
-				"vmap failed\n");
+				"cam-raw-dump: vmap failed\n");
 
-			kp_end_cpu(buf, 0);
-			kp_dma_buf_put(buf);
+			kp_end_cpu(
+				buf,
+				0);
+
+			kp_dma_buf_put(
+				buf);
+
 			return;
 		}
 
 		/*
-		 * 第一版先限制最大捕获尺寸，
-		 * 防止异常 buffer 消耗过多内存。
-		 */
-		len = 0;
-
-		/*
-		 * dma_buf 的 size 在目标内核中
-		 * 已确认存在。
+		 * 这里暂时使用已经从源码确认的 dma_buf
+		 * size 字段位置。
+		 *
+		 * 不在 hook 中读取/修改图像数据。
 		 */
 		{
-			unsigned long *p;
+			unsigned long *size_ptr;
 
-			/*
-			 * struct dma_buf 的 size 是 size_t。
-			 * 这里不引入完整 linux/dma-buf.h，
-			 * 只读取已确认的 size 字段。
-			 */
-			p =
+			size_ptr =
 				(unsigned long *)(
 					(unsigned char *)buf +
 					sizeof(void *) * 6);
 
-			len = *p;
+			capture_len =
+				*size_ptr;
 		}
 
-		pr_info(
-			"cam-raw-dump: "
-			"vmap=%lx len=%lu\n",
-			(unsigned long)vaddr,
-			len);
-
-		if (!len ||
-		    len > MAX_CAPTURE_SIZE) {
+		if (!capture_len ||
+		    capture_len > (64UL * 1024 * 1024)) {
 
 			pr_info(
-				"cam-raw-dump: "
-				"invalid buffer size=%lu\n",
-				len);
+				"cam-raw-dump: invalid size=%lu\n",
+				capture_len);
 
-			kp_vunmap(buf, vaddr);
-			kp_end_cpu(buf, 0);
-			kp_dma_buf_put(buf);
+			kp_vunmap(
+				buf,
+				vaddr);
+
+			kp_end_cpu(
+				buf,
+				0);
+
+			kp_dma_buf_put(
+				buf);
+
+			capture_len = 0;
 			return;
 		}
 
-		dst = kmalloc(
-			len,
-			GFP_KERNEL);
+		capture_buf = buf;
+		capture_vaddr = vaddr;
+		capture_request =
+			(unsigned long)
+			packet->header.request_id;
 
-		if (!dst) {
-			pr_info(
-				"cam-raw-dump: "
-				"kmalloc failed size=%lu\n",
-				len);
-
-			kp_vunmap(buf, vaddr);
-			kp_end_cpu(buf, 0);
-			kp_dma_buf_put(buf);
-			return;
-		}
-
-		memcpy(
-			dst,
-			vaddr,
-			len);
-
-		capture_buf = dst;
-		capture_len = len;
 		captured = 1;
 		armed = 0;
 
 		pr_info(
-			"cam-raw-dump: "
-			"captured %lu bytes\n",
-			len);
-
-		kp_vunmap(buf, vaddr);
-		kp_end_cpu(buf, 0);
-		kp_dma_buf_put(buf);
+			"cam-raw-dump: CAPTURED "
+			"req=%lu fd=%u vaddr=%lx len=%lu\n",
+			capture_request,
+			fd,
+			(unsigned long)vaddr,
+			capture_len);
 
 		return;
 	}
@@ -409,9 +393,9 @@ static long cam_kpm_init(
 			"kernel_write");
 
 	pr_info(
-		"cam-raw-dump: "
-		"prepare=%lx get=%lx begin=%lx "
-		"vmap=%lx write=%lx\n",
+		"cam-raw-dump: prepare=%lx "
+		"get=%lx begin=%lx vmap=%lx "
+		"write=%lx\n",
 		addr_prepare,
 		addr_dma_buf_get,
 		addr_begin_cpu,
@@ -492,6 +476,23 @@ static long cam_kpm_control0(
 
 	if (args[0] == 'c') {
 
+		/*
+		 * 上一次捕获已经存在时，
+		 * 不允许直接覆盖。
+		 */
+		if (capture_buf) {
+			pr_info(
+				"cam-raw-dump: "
+				"capture already exists\n");
+
+			compat_copy_to_user(
+				out_msg,
+				"exists",
+				7);
+
+			return 0;
+		}
+
 		armed = 1;
 		captured = 0;
 
@@ -502,6 +503,23 @@ static long cam_kpm_control0(
 			out_msg,
 			"armed",
 			6);
+
+	} else if (args[0] == 'w') {
+
+		pr_info(
+			"cam-raw-dump: writing\n");
+
+		write_capture();
+
+		/*
+		 * 写完释放 DMA-BUF 映射。
+		 */
+		release_capture();
+
+		compat_copy_to_user(
+			out_msg,
+			"written",
+			8);
 
 	} else if (args[0] == 's') {
 
@@ -517,18 +535,6 @@ static long cam_kpm_control0(
 			out_msg,
 			"stopped",
 			8);
-
-	} else if (args[0] == 'w') {
-
-		pr_info(
-			"cam-raw-dump: writing capture\n");
-
-		write_capture();
-
-		compat_copy_to_user(
-			out_msg,
-			"written",
-			8);
 	}
 
 	return 0;
@@ -537,15 +543,13 @@ static long cam_kpm_control0(
 static long cam_kpm_exit(
 	void *reserved)
 {
+	armed = 0;
+
 	if (addr_prepare)
 		unhook(
 			(void *)addr_prepare);
 
-	if (capture_buf) {
-		kfree(capture_buf);
-		capture_buf = NULL;
-		capture_len = 0;
-	}
+	release_capture();
 
 	pr_info(
 		"cam-raw-dump: exit\n");
