@@ -5,14 +5,16 @@
 #include <hook.h>
 
 KPM_NAME("cam-raw-dump");
-KPM_VERSION("1.5.0");
+KPM_VERSION("1.6.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI0 buffer-done verification");
+KPM_DESCRIPTION("RDI0 dma_buf cross-context probe");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
 #define MAX_RES 32
+
+struct dma_buf;
 
 struct kp_cam_packet_header {
 	unsigned int op_code;
@@ -24,6 +26,7 @@ struct kp_cam_packet_header {
 
 struct kp_cam_packet {
 	struct kp_cam_packet_header header;
+
 	unsigned int cmd_buf_offset;
 	unsigned int num_cmd_buf;
 	unsigned int io_configs_offset;
@@ -32,6 +35,7 @@ struct kp_cam_packet {
 	unsigned int num_patches;
 	unsigned int kmd_cmd_buf_index;
 	unsigned int kmd_cmd_buf_offset;
+
 	unsigned long long payload[1];
 };
 
@@ -62,39 +66,32 @@ struct kp_cam_cmd_buf_desc {
 struct kp_cam_buf_io_cfg {
 	int mem_handle[3];
 	unsigned int offsets[3];
+
 	struct kp_cam_plane_cfg planes[3];
+
 	unsigned int format;
 	unsigned int color_space;
 	unsigned int color_pattern;
 	unsigned int bpp;
 	unsigned int rotation;
 	unsigned int resource_type;
+
 	int fence;
 	int early_fence;
+
 	struct kp_cam_cmd_buf_desc aux_cmd_buf;
+
 	unsigned int direction;
 	unsigned int batch_size;
 	unsigned int subsample_pattern;
 	unsigned int subsample_period;
 	unsigned int framedrop_pattern;
 	unsigned int framedrop_period;
+
 	unsigned int flag;
 	unsigned int padding;
 };
 
-/*
- * cam_isp_hw_event_info
- *
- * enum cam_isp_resource_type  : u32
- * bool is_secondary_evt       : u8
- * 3 bytes padding
- * uint32_t res_id
- * uint32_t hw_idx
- * uint32_t reg_val
- * uint32_t hw_type
- * uint32_t in_core_idx
- * void *event_data
- */
 struct kp_cam_isp_hw_event_info {
 	unsigned int res_type;
 	unsigned char is_secondary_evt;
@@ -107,9 +104,6 @@ struct kp_cam_isp_hw_event_info {
 	void *event_data;
 };
 
-/*
- * cam_isp_hw_compdone_event_info
- */
 struct kp_cam_isp_hw_compdone_event_info {
 	unsigned int num_res;
 	unsigned int res_id[MAX_RES];
@@ -119,15 +113,24 @@ struct kp_cam_isp_hw_compdone_event_info {
 static unsigned long addr_prepare;
 static unsigned long addr_buf_done;
 
+static struct dma_buf *(*p_dma_buf_get)(int);
+static void (*p_dma_buf_put)(struct dma_buf *);
+static int (*p_dma_buf_begin_cpu_access)(struct dma_buf *, int);
+static int (*p_dma_buf_end_cpu_access)(struct dma_buf *, int);
+
 static volatile int armed;
+static volatile int done_seen;
+
+static struct dma_buf *saved_dmabuf;
+
+static volatile int saved_fd;
+static volatile unsigned int saved_handle;
+static volatile unsigned long long saved_request;
 
 static volatile unsigned int prepare_count;
 static volatile unsigned int done_count;
-static volatile unsigned int rdi_done_count;
 
-static volatile int last_rdi_fd;
-static volatile unsigned int last_rdi_handle;
-static volatile unsigned long long last_rdi_request;
+static volatile int test_result;
 
 static void before_prepare(
 	hook_fargs2_t *args,
@@ -135,9 +138,13 @@ static void before_prepare(
 {
 	struct kp_cam_packet *packet;
 	struct kp_cam_buf_io_cfg *io_cfg;
-	unsigned int i;
 
-	if (!armed)
+	unsigned int i;
+	unsigned int handle;
+	int fd;
+	struct dma_buf *dmabuf;
+
+	if (!armed || saved_dmabuf)
 		return;
 
 	packet =
@@ -155,9 +162,7 @@ static void before_prepare(
 			(unsigned char *)packet->payload +
 			packet->io_configs_offset);
 
-	for (i = 0;
-	     i < packet->num_io_configs;
-	     i++) {
+	for (i = 0; i < packet->num_io_configs; i++) {
 
 		if (io_cfg[i].direction != CAM_BUF_OUTPUT)
 			continue;
@@ -168,25 +173,44 @@ static void before_prepare(
 		if (!io_cfg[i].mem_handle[0])
 			continue;
 
-		last_rdi_handle =
+		handle =
 			(unsigned int)
 			io_cfg[i].mem_handle[0];
 
-		last_rdi_fd =
-			(int)(
-				last_rdi_handle >> 16);
+		fd = (int)(handle >> 16);
 
-		last_rdi_request =
-			packet->header.request_id;
+		dmabuf =
+			p_dma_buf_get(fd);
+
+		if (!dmabuf) {
+			pr_info(
+				"cam-raw-dump: PREP dma_buf_get "
+				"FAILED fd=%d\n",
+				fd);
+			test_result = -1;
+			return;
+		}
+
+		/*
+		 * 故意不 put。
+		 * 我们保留这一个 reference，
+		 * 直到测试结束。
+		 */
+		saved_dmabuf = dmabuf;
+		saved_fd = fd;
+		saved_handle = handle;
+		saved_request = packet->header.request_id;
 
 		prepare_count++;
 
 		pr_info(
-			"cam-raw-dump: PREP RDI0 "
-			"req=%llu mem=0x%x fd=%d\n",
-			last_rdi_request,
-			last_rdi_handle,
-			last_rdi_fd);
+			"cam-raw-dump: PREP saved "
+			"req=%llu mem=0x%x fd=%d "
+			"dmabuf=%p\n",
+			saved_request,
+			saved_handle,
+			saved_fd,
+			saved_dmabuf);
 
 		return;
 	}
@@ -202,17 +226,13 @@ static void before_buf_done(
 	unsigned int i;
 	unsigned int num_res;
 
-	if (!armed)
+	if (!armed || done_seen)
 		return;
 
 	event_info =
-		(struct kp_cam_isp_hw_event_info *)
-		args->arg1;
+		(struct kp_cam_isp_hw_event_info *)args->arg1;
 
-	if (!event_info)
-		return;
-
-	if (!event_info->event_data)
+	if (!event_info || !event_info->event_data)
 		return;
 
 	compdone =
@@ -231,18 +251,18 @@ static void before_buf_done(
 		if (compdone->res_id[i] != RDI_0)
 			continue;
 
-		rdi_done_count++;
+		done_seen = 1;
 
 		pr_info(
-			"cam-raw-dump: RDI0 BUF DONE "
-			"hw_idx=%u res=0x%x last_addr=0x%x "
-			"saved_req=%llu saved_mem=0x%x fd=%d\n",
-			event_info->hw_idx,
-			compdone->res_id[i],
-			compdone->last_consumed_addr[i],
-			last_rdi_request,
-			last_rdi_handle,
-			last_rdi_fd);
+			"cam-raw-dump: DONE "
+			"req=%llu mem=0x%x fd=%d "
+			"dmabuf=%p\n",
+			saved_request,
+			saved_handle,
+			saved_fd,
+			saved_dmabuf);
+
+		return;
 	}
 }
 
@@ -259,13 +279,37 @@ static long cam_kpm_init(
 		kallsyms_lookup_name(
 			"cam_ife_hw_mgr_handle_hw_buf_done");
 
+	p_dma_buf_get =
+		(void *)kallsyms_lookup_name(
+			"dma_buf_get");
+
+	p_dma_buf_put =
+		(void *)kallsyms_lookup_name(
+			"dma_buf_put");
+
+	p_dma_buf_begin_cpu_access =
+		(void *)kallsyms_lookup_name(
+			"dma_buf_begin_cpu_access");
+
+	p_dma_buf_end_cpu_access =
+		(void *)kallsyms_lookup_name(
+			"dma_buf_end_cpu_access");
+
 	pr_info(
 		"cam-raw-dump: prepare=%lx "
-		"buf_done=%lx\n",
+		"buf_done=%lx get=%p begin=%p end=%p\n",
 		addr_prepare,
-		addr_buf_done);
+		addr_buf_done,
+		p_dma_buf_get,
+		p_dma_buf_begin_cpu_access,
+		p_dma_buf_end_cpu_access);
 
-	if (!addr_prepare || !addr_buf_done)
+	if (!addr_prepare ||
+	    !addr_buf_done ||
+	    !p_dma_buf_get ||
+	    !p_dma_buf_put ||
+	    !p_dma_buf_begin_cpu_access ||
+	    !p_dma_buf_end_cpu_access)
 		return -1;
 
 	if (hook_wrap2(
@@ -280,6 +324,7 @@ static long cam_kpm_init(
 		before_buf_done,
 		NULL,
 		NULL)) {
+
 		unhook((void *)addr_prepare);
 		return -1;
 	}
@@ -295,22 +340,28 @@ static long cam_kpm_control0(
 	char __user *out_msg,
 	int outlen)
 {
-	char status[32];
+	int rc;
 
 	if (!args)
 		return -1;
 
 	if (args[0] == 'c') {
 
-		armed = 1;
+		if (saved_dmabuf) {
+			p_dma_buf_put(saved_dmabuf);
+			saved_dmabuf = NULL;
+		}
 
+		armed = 1;
+		done_seen = 0;
+
+		saved_fd = -1;
+		saved_handle = 0;
+		saved_request = 0;
+
+		test_result = 0;
 		prepare_count = 0;
 		done_count = 0;
-		rdi_done_count = 0;
-
-		last_rdi_fd = -1;
-		last_rdi_handle = 0;
-		last_rdi_request = 0;
 
 		pr_info(
 			"cam-raw-dump: armed\n");
@@ -320,28 +371,100 @@ static long cam_kpm_control0(
 			"armed",
 			6);
 
+	} else if (args[0] == 'g') {
+
+		if (!saved_dmabuf) {
+			pr_info(
+				"cam-raw-dump: "
+				"no saved dma_buf\n");
+
+			compat_copy_to_user(
+				out_msg,
+				"no_buf",
+				7);
+
+			return 0;
+		}
+
+		if (!done_seen) {
+			pr_info(
+				"cam-raw-dump: "
+				"RDI0 DONE not seen\n");
+
+			compat_copy_to_user(
+				out_msg,
+				"no_done",
+				8);
+
+			return 0;
+		}
+
+		pr_info(
+			"cam-raw-dump: G begin "
+			"dmabuf=%p fd=%d req=%llu\n",
+			saved_dmabuf,
+			saved_fd,
+			saved_request);
+
+		rc =
+			p_dma_buf_begin_cpu_access(
+				saved_dmabuf,
+				0);
+
+		test_result = rc;
+
+		pr_info(
+			"cam-raw-dump: G "
+			"begin_cpu_access rc=%d\n",
+			rc);
+
+		if (rc == 0) {
+
+			rc =
+				p_dma_buf_end_cpu_access(
+					saved_dmabuf,
+					0);
+
+			pr_info(
+				"cam-raw-dump: G "
+				"end_cpu_access rc=%d\n",
+				rc);
+
+			compat_copy_to_user(
+				out_msg,
+				"begin_ok",
+				9);
+
+		} else {
+
+			compat_copy_to_user(
+				out_msg,
+				"begin_fail",
+				11);
+		}
+
 	} else if (args[0] == 's') {
 
 		armed = 0;
 
 		pr_info(
 			"cam-raw-dump: STOP "
-			"prepare=%u done=%u rdi_done=%u "
-			"last_req=%llu last_mem=0x%x fd=%d\n",
+			"prepare=%u done=%u "
+			"result=%d saved_dmabuf=%p\n",
 			prepare_count,
 			done_count,
-			rdi_done_count,
-			last_rdi_request,
-			last_rdi_handle,
-			last_rdi_fd);
+			test_result,
+			saved_dmabuf);
 
-		status[0] = 's';
-		status[1] = '\0';
+		if (saved_dmabuf) {
+			p_dma_buf_put(saved_dmabuf);
+			saved_dmabuf = NULL;
+		}
 
 		compat_copy_to_user(
 			out_msg,
-			status,
-			2);
+			"stopped",
+			8);
 	}
 
 	return 0;
@@ -357,6 +480,11 @@ static long cam_kpm_exit(
 
 	if (addr_prepare)
 		unhook((void *)addr_prepare);
+
+	if (saved_dmabuf && p_dma_buf_put)
+		p_dma_buf_put(saved_dmabuf);
+
+	saved_dmabuf = NULL;
 
 	pr_info(
 		"cam-raw-dump: exit\n");
