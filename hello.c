@@ -5,10 +5,10 @@
 #include <hook.h>
 
 KPM_NAME("cam-raw-dump");
-KPM_VERSION("1.6.3");
+KPM_VERSION("1.6.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI0 dma_buf vmap probe");
+KPM_DESCRIPTION("RDI0 dma_buf 64-byte read probe");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
@@ -173,7 +173,6 @@ static void before_prepare(
 			packet->io_configs_offset);
 
 	for (i = 0; i < packet->num_io_configs; i++) {
-
 		if (io_cfg[i].direction != CAM_BUF_OUTPUT)
 			continue;
 
@@ -247,8 +246,7 @@ static void before_buf_done(
 		(struct kp_cam_isp_hw_compdone_event_info *)
 		event_info->event_data;
 
-	num_res =
-		compdone->num_res;
+	num_res = compdone->num_res;
 
 	if (num_res > MAX_RES)
 		num_res = MAX_RES;
@@ -256,7 +254,6 @@ static void before_buf_done(
 	done_count++;
 
 	for (i = 0; i < num_res; i++) {
-
 		if (compdone->res_id[i] != RDI_0)
 			continue;
 
@@ -272,6 +269,38 @@ static void before_buf_done(
 			saved_dmabuf);
 
 		return;
+	}
+}
+
+static void print_64_bytes(
+	const unsigned char *p)
+{
+	unsigned int i;
+
+	for (i = 0; i < 64; i += 16) {
+		pr_info(
+			"cam-raw-dump: DATA %02u: "
+			"%02x %02x %02x %02x "
+			"%02x %02x %02x %02x "
+			"%02x %02x %02x %02x "
+			"%02x %02x %02x %02x\n",
+			i,
+			p[i + 0],
+			p[i + 1],
+			p[i + 2],
+			p[i + 3],
+			p[i + 4],
+			p[i + 5],
+			p[i + 6],
+			p[i + 7],
+			p[i + 8],
+			p[i + 9],
+			p[i + 10],
+			p[i + 11],
+			p[i + 12],
+			p[i + 13],
+			p[i + 14],
+			p[i + 15]);
 	}
 }
 
@@ -424,8 +453,7 @@ static long cam_kpm_control0(
 		}
 
 		pr_info(
-			"cam-raw-dump: "
-			"VMAP test begin "
+			"cam-raw-dump: READ64 begin "
 			"dmabuf=%p fd=%d req=%llu\n",
 			saved_dmabuf,
 			saved_fd,
@@ -477,17 +505,22 @@ static long cam_kpm_control0(
 		}
 
 		/*
-		 * 关键：
-		 * 这里只验证 vmap/vunmap。
-		 * 不读取 vaddr 指向的任何内容。
+		 * 只读取 64 字节。
+		 * 不做整帧 memcpy。
 		 */
+		print_64_bytes(
+			(const unsigned char *)vaddr);
+
+		pr_info(
+			"cam-raw-dump: "
+			"read64 ok\n");
+
 		p_dma_buf_vunmap(
 			saved_dmabuf,
 			vaddr);
 
 		pr_info(
-			"cam-raw-dump: "
-			"vunmap ok\n");
+			"cam-raw-dump: vunmap ok\n");
 
 		rc =
 			p_dma_buf_end_cpu_access(
@@ -503,8 +536,8 @@ static long cam_kpm_control0(
 
 		compat_copy_to_user(
 			out_msg,
-			"vmap_ok",
-			8);
+			"read64_ok",
+			10);
 
 	} else if (args[0] == 's') {
 
