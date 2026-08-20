@@ -1,26 +1,18 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <linux/string.h>
 #include <kputils.h>
 #include <hook.h>
 
 KPM_NAME("cam-raw-dump");
-KPM_VERSION("1.4.0");
+KPM_VERSION("1.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Camera RDI0 raw capture with safe deferred disk write");
-
-#define O_WRONLY 00000001
-#define O_CREAT  00000100
-#define O_TRUNC  00001000
+KPM_DESCRIPTION("RDI0 buffer-done verification");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
-
-#define DYNAMIC_BUF_SIZE (32 * 1024 * 1024)
-
-struct dma_buf;
+#define MAX_RES 32
 
 struct kp_cam_packet_header {
 	unsigned int op_code;
@@ -70,21 +62,16 @@ struct kp_cam_cmd_buf_desc {
 struct kp_cam_buf_io_cfg {
 	int mem_handle[3];
 	unsigned int offsets[3];
-
 	struct kp_cam_plane_cfg planes[3];
-
 	unsigned int format;
 	unsigned int color_space;
 	unsigned int color_pattern;
 	unsigned int bpp;
 	unsigned int rotation;
 	unsigned int resource_type;
-
 	int fence;
 	int early_fence;
-
 	struct kp_cam_cmd_buf_desc aux_cmd_buf;
-
 	unsigned int direction;
 	unsigned int batch_size;
 	unsigned int subsample_pattern;
@@ -95,58 +82,52 @@ struct kp_cam_buf_io_cfg {
 	unsigned int padding;
 };
 
-static void *(*p_filp_open)(
-	const char *, int, unsigned int);
+/*
+ * cam_isp_hw_event_info
+ *
+ * enum cam_isp_resource_type  : u32
+ * bool is_secondary_evt       : u8
+ * 3 bytes padding
+ * uint32_t res_id
+ * uint32_t hw_idx
+ * uint32_t reg_val
+ * uint32_t hw_type
+ * uint32_t in_core_idx
+ * void *event_data
+ */
+struct kp_cam_isp_hw_event_info {
+	unsigned int res_type;
+	unsigned char is_secondary_evt;
+	unsigned char reserved[3];
+	unsigned int res_id;
+	unsigned int hw_idx;
+	unsigned int reg_val;
+	unsigned int hw_type;
+	unsigned int in_core_idx;
+	void *event_data;
+};
 
-static long (*p_kernel_write)(
-	void *, const void *, unsigned long, long long *);
-
-static int (*p_filp_close)(
-	void *, void *);
-
-static void *(*p_vmalloc)(
-	unsigned long);
-
-static void (*p_vfree)(
-	const void *);
-
-static struct dma_buf *(*p_dma_buf_get)(int);
-static void (*p_dma_buf_put)(struct dma_buf *);
-
-static int (*p_dma_buf_begin_cpu_access)(
-	struct dma_buf *, int);
-
-static int (*p_dma_buf_end_cpu_access)(
-	struct dma_buf *, int);
-
-static void *(*p_dma_buf_vmap)(
-	struct dma_buf *);
-
-static void (*p_dma_buf_vunmap)(
-	struct dma_buf *, void *);
+/*
+ * cam_isp_hw_compdone_event_info
+ */
+struct kp_cam_isp_hw_compdone_event_info {
+	unsigned int num_res;
+	unsigned int res_id[MAX_RES];
+	unsigned int last_consumed_addr[MAX_RES];
+};
 
 static unsigned long addr_prepare;
+static unsigned long addr_buf_done;
 
-static unsigned char *dyn_buf;
+static volatile int armed;
 
-static volatile char capture_status;
+static volatile unsigned int prepare_count;
+static volatile unsigned int done_count;
+static volatile unsigned int rdi_done_count;
 
-static volatile unsigned int cnt_hook;
-static volatile unsigned int cnt_rdi;
-static volatile unsigned int cnt_copy_ok;
-static volatile unsigned int cnt_copy_fail;
-
-static volatile unsigned long cached_len;
-static volatile unsigned long cached_request;
-static volatile unsigned int cached_width;
-static volatile unsigned int cached_height;
-static volatile unsigned int cached_stride;
-static volatile unsigned int cached_format;
-
-static int is_err_ptr(void *ptr)
-{
-	return (unsigned long)ptr >= (unsigned long)-4095;
-}
+static volatile int last_rdi_fd;
+static volatile unsigned int last_rdi_handle;
+static volatile unsigned long long last_rdi_request;
 
 static void before_prepare(
 	hook_fargs2_t *args,
@@ -154,26 +135,9 @@ static void before_prepare(
 {
 	struct kp_cam_packet *packet;
 	struct kp_cam_buf_io_cfg *io_cfg;
-
-	struct dma_buf *dmabuf;
-	void *vaddr;
-
 	unsigned int i;
-	unsigned int handle;
-	unsigned int fd;
 
-	unsigned long width;
-	unsigned long height;
-	unsigned long stride;
-	unsigned long slice_height;
-	unsigned long len;
-	unsigned long offset;
-
-	int rc;
-
-	cnt_hook++;
-
-	if (capture_status != 1)
+	if (!armed)
 		return;
 
 	packet =
@@ -204,221 +168,82 @@ static void before_prepare(
 		if (!io_cfg[i].mem_handle[0])
 			continue;
 
-		cnt_rdi++;
-
-		width =
-			io_cfg[i].planes[0].width;
-
-		height =
-			io_cfg[i].planes[0].height;
-
-		stride =
-			io_cfg[i].planes[0].plane_stride;
-
-		slice_height =
-			io_cfg[i].planes[0].slice_height;
-
-		if (!slice_height)
-			slice_height = height;
-
-		len = stride * slice_height;
-		offset = io_cfg[i].offsets[0];
-
-		if (!len ||
-		    len > DYNAMIC_BUF_SIZE) {
-
-			pr_info(
-				"cam-raw-dump: invalid RDI0 "
-				"len=%lu width=%lu height=%lu "
-				"stride=%lu slice=%lu\n",
-				len,
-				width,
-				height,
-				stride,
-				slice_height);
-
-			cnt_copy_fail++;
-			return;
-		}
-
-		handle =
+		last_rdi_handle =
 			(unsigned int)
 			io_cfg[i].mem_handle[0];
 
-		fd = handle >> 16;
+		last_rdi_fd =
+			(int)(
+				last_rdi_handle >> 16);
 
-		pr_info(
-			"cam-raw-dump: RDI0 req=%llu "
-			"mem=0x%x fd=%u width=%lu "
-			"height=%lu stride=%lu len=%lu "
-			"offset=%lu format=%u\n",
-			packet->header.request_id,
-			handle,
-			fd,
-			width,
-			height,
-			stride,
-			len,
-			offset,
-			io_cfg[i].format);
-
-		dmabuf =
-			p_dma_buf_get((int)fd);
-
-		if (!dmabuf) {
-			pr_info(
-				"cam-raw-dump: dma_buf_get failed "
-				"fd=%u\n",
-				fd);
-
-			cnt_copy_fail++;
-			return;
-		}
-
-		rc =
-			p_dma_buf_begin_cpu_access(
-				dmabuf,
-				0);
-
-		if (rc) {
-			pr_info(
-				"cam-raw-dump: begin_cpu_access "
-				"rc=%d\n",
-				rc);
-
-			p_dma_buf_put(dmabuf);
-			cnt_copy_fail++;
-			return;
-		}
-
-		vaddr =
-			p_dma_buf_vmap(dmabuf);
-
-		if (!vaddr) {
-			pr_info(
-				"cam-raw-dump: vmap failed\n");
-
-			p_dma_buf_end_cpu_access(
-				dmabuf,
-				0);
-
-			p_dma_buf_put(dmabuf);
-
-			cnt_copy_fail++;
-			return;
-		}
-
-		if (offset + len > DYNAMIC_BUF_SIZE) {
-			pr_info(
-				"cam-raw-dump: capture size "
-				"exceeds local buffer\n");
-
-			p_dma_buf_vunmap(
-				dmabuf,
-				vaddr);
-
-			p_dma_buf_end_cpu_access(
-				dmabuf,
-				0);
-
-			p_dma_buf_put(dmabuf);
-
-			cnt_copy_fail++;
-			return;
-		}
-
-		memcpy(
-			dyn_buf,
-			(unsigned char *)vaddr + offset,
-			len);
-
-		p_dma_buf_vunmap(
-			dmabuf,
-			vaddr);
-
-		p_dma_buf_end_cpu_access(
-			dmabuf,
-			0);
-
-		p_dma_buf_put(dmabuf);
-
-		cached_len = len;
-		cached_request =
-			(unsigned long)
+		last_rdi_request =
 			packet->header.request_id;
 
-		cached_width =
-			(unsigned int)width;
-
-		cached_height =
-			(unsigned int)height;
-
-		cached_stride =
-			(unsigned int)stride;
-
-		cached_format =
-			io_cfg[i].format;
-
-		cnt_copy_ok++;
-		capture_status = 2;
+		prepare_count++;
 
 		pr_info(
-			"cam-raw-dump: CAPTURE OK "
-			"req=%lu len=%lu width=%u "
-			"height=%u stride=%u format=%u\n",
-			cached_request,
-			cached_len,
-			cached_width,
-			cached_height,
-			cached_stride,
-			cached_format);
+			"cam-raw-dump: PREP RDI0 "
+			"req=%llu mem=0x%x fd=%d\n",
+			last_rdi_request,
+			last_rdi_handle,
+			last_rdi_fd);
 
 		return;
 	}
 }
 
-static int write_cached_frame_to_disk(void)
+static void before_buf_done(
+	hook_fargs2_t *args,
+	void *udata)
 {
-	void *file;
-	long long pos = 0;
-	long written;
+	struct kp_cam_isp_hw_event_info *event_info;
+	struct kp_cam_isp_hw_compdone_event_info *compdone;
 
-	if (!cached_len || !dyn_buf)
-		return -1;
+	unsigned int i;
+	unsigned int num_res;
 
-	file = p_filp_open(
-		"/data/local/tmp/rdi0.raw",
-		O_CREAT | O_WRONLY | O_TRUNC,
-		0644);
+	if (!armed)
+		return;
 
-	if (is_err_ptr(file)) {
-		pr_err(
-			"cam-raw-dump: open failed\n");
-		return -1;
+	event_info =
+		(struct kp_cam_isp_hw_event_info *)
+		args->arg1;
+
+	if (!event_info)
+		return;
+
+	if (!event_info->event_data)
+		return;
+
+	compdone =
+		(struct kp_cam_isp_hw_compdone_event_info *)
+		event_info->event_data;
+
+	num_res = compdone->num_res;
+
+	if (num_res > MAX_RES)
+		num_res = MAX_RES;
+
+	done_count++;
+
+	for (i = 0; i < num_res; i++) {
+
+		if (compdone->res_id[i] != RDI_0)
+			continue;
+
+		rdi_done_count++;
+
+		pr_info(
+			"cam-raw-dump: RDI0 BUF DONE "
+			"hw_idx=%u res=0x%x last_addr=0x%x "
+			"saved_req=%llu saved_mem=0x%x fd=%d\n",
+			event_info->hw_idx,
+			compdone->res_id[i],
+			compdone->last_consumed_addr[i],
+			last_rdi_request,
+			last_rdi_handle,
+			last_rdi_fd);
 	}
-
-	written =
-		p_kernel_write(
-			file,
-			dyn_buf,
-			cached_len,
-			&pos);
-
-	p_filp_close(
-		file,
-		NULL);
-
-	pr_info(
-		"cam-raw-dump: written=%ld "
-		"expected=%lu req=%lu\n",
-		written,
-		cached_len,
-		cached_request);
-
-	if (written != (long)cached_len)
-		return -1;
-
-	return 0;
 }
 
 static long cam_kpm_init(
@@ -426,101 +251,36 @@ static long cam_kpm_init(
 	const char *event,
 	void *reserved)
 {
-	p_filp_open =
-		(void *)kallsyms_lookup_name(
-			"filp_open");
-
-	p_kernel_write =
-		(void *)kallsyms_lookup_name(
-			"kernel_write");
-
-	p_filp_close =
-		(void *)kallsyms_lookup_name(
-			"filp_close");
-
-	p_vmalloc =
-		(void *)kallsyms_lookup_name(
-			"vmalloc");
-
-	p_vfree =
-		(void *)kallsyms_lookup_name(
-			"vfree");
-
-	p_dma_buf_get =
-		(void *)kallsyms_lookup_name(
-			"dma_buf_get");
-
-	p_dma_buf_put =
-		(void *)kallsyms_lookup_name(
-			"dma_buf_put");
-
-	p_dma_buf_begin_cpu_access =
-		(void *)kallsyms_lookup_name(
-			"dma_buf_begin_cpu_access");
-
-	p_dma_buf_end_cpu_access =
-		(void *)kallsyms_lookup_name(
-			"dma_buf_end_cpu_access");
-
-	p_dma_buf_vmap =
-		(void *)kallsyms_lookup_name(
-			"dma_buf_vmap");
-
-	p_dma_buf_vunmap =
-		(void *)kallsyms_lookup_name(
-			"dma_buf_vunmap");
-
 	addr_prepare =
 		kallsyms_lookup_name(
 			"cam_ife_mgr_prepare_hw_update");
 
-	if (!p_filp_open ||
-	    !p_kernel_write ||
-	    !p_filp_close ||
-	    !p_vmalloc ||
-	    !p_vfree ||
-	    !p_dma_buf_get ||
-	    !p_dma_buf_put ||
-	    !p_dma_buf_begin_cpu_access ||
-	    !p_dma_buf_end_cpu_access ||
-	    !p_dma_buf_vmap ||
-	    !p_dma_buf_vunmap ||
-	    !addr_prepare) {
-
-		pr_err(
-			"cam-raw-dump: symbol lookup failed\n");
-
-		return -1;
-	}
-
-	dyn_buf =
-		p_vmalloc(
-			DYNAMIC_BUF_SIZE);
+	addr_buf_done =
+		kallsyms_lookup_name(
+			"cam_ife_hw_mgr_handle_hw_buf_done");
 
 	pr_info(
-		"cam-raw-dump: dyn_buf=%p size=%d\n",
-		dyn_buf,
-		DYNAMIC_BUF_SIZE);
+		"cam-raw-dump: prepare=%lx "
+		"buf_done=%lx\n",
+		addr_prepare,
+		addr_buf_done);
 
-	if (!dyn_buf) {
-		pr_err(
-			"cam-raw-dump: vmalloc failed\n");
-
+	if (!addr_prepare || !addr_buf_done)
 		return -1;
-	}
 
 	if (hook_wrap2(
 		(void *)addr_prepare,
 		before_prepare,
 		NULL,
+		NULL))
+		return -1;
+
+	if (hook_wrap2(
+		(void *)addr_buf_done,
+		before_buf_done,
+		NULL,
 		NULL)) {
-
-		pr_err(
-			"cam-raw-dump: hook prepare failed\n");
-
-		p_vfree(dyn_buf);
-		dyn_buf = NULL;
-
+		unhook((void *)addr_prepare);
 		return -1;
 	}
 
@@ -535,16 +295,22 @@ static long cam_kpm_control0(
 	char __user *out_msg,
 	int outlen)
 {
-	char status[16];
+	char status[32];
 
 	if (!args)
 		return -1;
 
 	if (args[0] == 'c') {
 
-		capture_status = 1;
+		armed = 1;
 
-		cached_len = 0;
+		prepare_count = 0;
+		done_count = 0;
+		rdi_done_count = 0;
+
+		last_rdi_fd = -1;
+		last_rdi_handle = 0;
+		last_rdi_request = 0;
 
 		pr_info(
 			"cam-raw-dump: armed\n");
@@ -554,67 +320,28 @@ static long cam_kpm_control0(
 			"armed",
 			6);
 
-	} else if (args[0] == 'w') {
-
-		if (capture_status != 2 ||
-		    !cached_len) {
-
-			pr_info(
-				"cam-raw-dump: no frame\n");
-
-			compat_copy_to_user(
-				out_msg,
-				"no_frame",
-				9);
-
-			return 0;
-		}
-
-		if (write_cached_frame_to_disk() == 0) {
-
-			capture_status = 3;
-
-			compat_copy_to_user(
-				out_msg,
-				"write_ok",
-				9);
-
-		} else {
-
-			compat_copy_to_user(
-				out_msg,
-				"write_fail",
-				11);
-		}
-
 	} else if (args[0] == 's') {
 
+		armed = 0;
+
 		pr_info(
-			"cam-raw-dump: status=%d "
-			"hook=%u rdi=%u copy_ok=%u "
-			"copy_fail=%u cached_len=%lu "
-			"req=%lu width=%u height=%u "
-			"stride=%u format=%u\n",
-			capture_status,
-			cnt_hook,
-			cnt_rdi,
-			cnt_copy_ok,
-			cnt_copy_fail,
-			cached_len,
-			cached_request,
-			cached_width,
-			cached_height,
-			cached_stride,
-			cached_format);
+			"cam-raw-dump: STOP "
+			"prepare=%u done=%u rdi_done=%u "
+			"last_req=%llu last_mem=0x%x fd=%d\n",
+			prepare_count,
+			done_count,
+			rdi_done_count,
+			last_rdi_request,
+			last_rdi_handle,
+			last_rdi_fd);
 
 		status[0] = 's';
-		status[1] = '0' + capture_status;
-		status[2] = '\0';
+		status[1] = '\0';
 
 		compat_copy_to_user(
 			out_msg,
 			status,
-			3);
+			2);
 	}
 
 	return 0;
@@ -623,15 +350,13 @@ static long cam_kpm_control0(
 static long cam_kpm_exit(
 	void *reserved)
 {
+	armed = 0;
+
+	if (addr_buf_done)
+		unhook((void *)addr_buf_done);
+
 	if (addr_prepare)
-		unhook(
-			(void *)addr_prepare);
-
-	if (dyn_buf &&
-	    p_vfree)
-		p_vfree(dyn_buf);
-
-	dyn_buf = NULL;
+		unhook((void *)addr_prepare);
 
 	pr_info(
 		"cam-raw-dump: exit\n");
