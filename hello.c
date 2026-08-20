@@ -15,7 +15,7 @@ KPM_DESCRIPTION("RDI0 1MB memcpy probe");
 #define RDI_0 0x3006
 #define MAX_RES 32
 
-#define TEST_COPY_SIZE (1UL * 1024 * 1024)
+#define TEST_COPY_SIZE (4UL * 1024 * 1024)
 
 struct dma_buf;
 
