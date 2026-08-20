@@ -18,7 +18,7 @@ KPM_DESCRIPTION("Camera RDI0 raw capture with safe deferred disk write");
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
 
-#define DYNAMIC_BUF_SIZE (8 * 1024 * 1024)
+#define DYNAMIC_BUF_SIZE (32 * 1024 * 1024)
 
 struct dma_buf;
 
