@@ -5,10 +5,10 @@
 #include <hook.h>
 
 KPM_NAME("cam-raw-dump");
-KPM_VERSION("1.3.1");
+KPM_VERSION("1.3.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI dma_buf CPU access probe");
+KPM_DESCRIPTION("RDI CPU vmap probe");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
@@ -78,42 +78,54 @@ struct kp_cam_buf_io_cfg {
 static unsigned long addr_prepare;
 static unsigned long addr_dma_buf_get;
 static unsigned long addr_dma_buf_put;
-static unsigned long addr_dma_buf_begin_cpu_access;
+static unsigned long addr_begin_cpu;
+static unsigned long addr_end_cpu;
+static unsigned long addr_vmap;
+static unsigned long addr_vunmap;
 
 static struct dma_buf *(*kp_dma_buf_get)(int fd);
 static void (*kp_dma_buf_put)(struct dma_buf *buf);
-static int (*kp_dma_buf_begin_cpu_access)(
+
+static int (*kp_begin_cpu)(
+	struct dma_buf *buf, int direction);
+
+static int (*kp_end_cpu)(
+	struct dma_buf *buf, int direction);
+
+static void *(*kp_vmap)(
+	struct dma_buf *buf);
+
+static void (*kp_vunmap)(
 	struct dma_buf *buf,
-	int direction);
+	void *vaddr);
 
 static volatile int armed;
+static volatile int dumped;
 static volatile unsigned int hook_count;
-static volatile unsigned int rdi_count;
-
-#define MAX_RDI_LOG 8
+static volatile unsigned int frame_count;
 
 static void before_prepare(hook_fargs2_t *args, void *udata)
 {
 	struct kp_cam_packet *packet;
 	struct kp_cam_buf_io_cfg *io_cfg;
+	struct dma_buf *buf;
+	void *vaddr;
 	unsigned int i;
-	unsigned int plane;
 	unsigned int handle;
 	unsigned int fd;
-	struct dma_buf *buf;
 	int rc;
 
 	hook_count++;
 
-	if (!armed || rdi_count >= MAX_RDI_LOG)
+	if (!armed || dumped)
 		return;
 
 	packet = *(struct kp_cam_packet **)args->arg1;
-
 	if (!packet)
 		return;
 
-	if (!packet->num_io_configs || packet->num_io_configs > 64)
+	if (!packet->num_io_configs ||
+	    packet->num_io_configs > 64)
 		return;
 
 	io_cfg = (struct kp_cam_buf_io_cfg *)(
@@ -124,64 +136,61 @@ static void before_prepare(hook_fargs2_t *args, void *udata)
 		if (io_cfg[i].direction != CAM_BUF_OUTPUT)
 			continue;
 
-		if (io_cfg[i].resource_type < RDI_0 ||
-		    io_cfg[i].resource_type > RDI_3)
+		if (io_cfg[i].resource_type != RDI_0)
 			continue;
 
-		rdi_count++;
+		if (!io_cfg[i].mem_handle[0])
+			continue;
+
+		frame_count++;
+
+		handle = (unsigned int)io_cfg[i].mem_handle[0];
+		fd = handle >> 16;
 
 		pr_info(
-			"cam-raw-dump: RDI res=0x%x req=%llu io=%u\n",
-			io_cfg[i].resource_type,
+			"cam-raw-dump: RDI0 req=%llu mem=0x%x fd=%u\n",
 			packet->header.request_id,
-			i);
+			handle,
+			fd);
 
-		for (plane = 0; plane < 3; plane++) {
-			if (!io_cfg[i].mem_handle[plane])
-				break;
-
-			handle = (unsigned int)io_cfg[i].mem_handle[plane];
-			fd = handle >> 16;
-
+		buf = kp_dma_buf_get((int)fd);
+		if (!buf) {
 			pr_info(
-				"cam-raw-dump: RDI=0x%x plane=%u "
-				"mem=0x%x fd=%u\n",
-				io_cfg[i].resource_type,
-				plane,
-				handle,
+				"cam-raw-dump: dma_buf_get failed fd=%u\n",
 				fd);
-
-			if (!kp_dma_buf_get || !kp_dma_buf_begin_cpu_access)
-				continue;
-
-			buf = kp_dma_buf_get((int)fd);
-
-			if (!buf) {
-				pr_info(
-					"cam-raw-dump: dma_buf_get failed "
-					"RDI=0x%x fd=%u\n",
-					io_cfg[i].resource_type,
-					fd);
-				continue;
-			}
-
-			rc = kp_dma_buf_begin_cpu_access(
-				buf, 0);
-
-			pr_info(
-				"cam-raw-dump: RDI=0x%x plane=%u "
-				"dma_buf=%p cpu_access_rc=%d\n",
-				io_cfg[i].resource_type,
-				plane,
-				buf,
-				rc);
-
-			if (kp_dma_buf_put)
-				kp_dma_buf_put(buf);
+			return;
 		}
 
-		if (rdi_count >= MAX_RDI_LOG)
-			break;
+		rc = kp_begin_cpu(buf, 0);
+		if (rc) {
+			pr_info(
+				"cam-raw-dump: begin_cpu_access failed rc=%d\n",
+				rc);
+			kp_dma_buf_put(buf);
+			return;
+		}
+
+		vaddr = kp_vmap(buf);
+
+		pr_info(
+			"cam-raw-dump: RDI0 vmap rc=%d vaddr=%lx\n",
+			vaddr ? 0 : -1,
+			(unsigned long)vaddr);
+
+		if (vaddr) {
+			/*
+			 * 这里只验证映射成功。
+			 * 暂时不读取和不修改 buffer。
+			 */
+			dumped = 1;
+
+			kp_vunmap(buf, vaddr);
+		}
+
+		kp_end_cpu(buf, 0);
+		kp_dma_buf_put(buf);
+
+		return;
 	}
 }
 
@@ -200,33 +209,63 @@ static long cam_kpm_init(
 	addr_dma_buf_put =
 		kallsyms_lookup_name("dma_buf_put");
 
-	addr_dma_buf_begin_cpu_access =
+	addr_begin_cpu =
 		kallsyms_lookup_name(
 			"dma_buf_begin_cpu_access");
 
+	addr_end_cpu =
+		kallsyms_lookup_name(
+			"dma_buf_end_cpu_access");
+
+	addr_vmap =
+		kallsyms_lookup_name("dma_buf_vmap");
+
+	addr_vunmap =
+		kallsyms_lookup_name("dma_buf_vunmap");
+
 	pr_info(
 		"cam-raw-dump: prepare=%lx get=%lx put=%lx "
-		"begin_cpu=%lx\n",
+		"begin=%lx end=%lx vmap=%lx vunmap=%lx\n",
 		addr_prepare,
 		addr_dma_buf_get,
 		addr_dma_buf_put,
-		addr_dma_buf_begin_cpu_access);
+		addr_begin_cpu,
+		addr_end_cpu,
+		addr_vmap,
+		addr_vunmap);
 
 	if (!addr_prepare ||
 	    !addr_dma_buf_get ||
 	    !addr_dma_buf_put ||
-	    !addr_dma_buf_begin_cpu_access)
+	    !addr_begin_cpu ||
+	    !addr_end_cpu ||
+	    !addr_vmap ||
+	    !addr_vunmap)
 		return -1;
 
 	kp_dma_buf_get =
-		(struct dma_buf *(*)(int))(void *)addr_dma_buf_get;
+		(struct dma_buf *(*)(int))
+		(void *)addr_dma_buf_get;
 
 	kp_dma_buf_put =
-		(void (*)(struct dma_buf *))(void *)addr_dma_buf_put;
+		(void (*)(struct dma_buf *))
+		(void *)addr_dma_buf_put;
 
-	kp_dma_buf_begin_cpu_access =
+	kp_begin_cpu =
 		(int (*)(struct dma_buf *, int))
-		(void *)addr_dma_buf_begin_cpu_access;
+		(void *)addr_begin_cpu;
+
+	kp_end_cpu =
+		(int (*)(struct dma_buf *, int))
+		(void *)addr_end_cpu;
+
+	kp_vmap =
+		(void *(*)(struct dma_buf *))
+		(void *)addr_vmap;
+
+	kp_vunmap =
+		(void (*)(struct dma_buf *, void *))
+		(void *)addr_vunmap;
 
 	if (hook_wrap2(
 		(void *)addr_prepare,
@@ -249,7 +288,8 @@ static long cam_kpm_control0(
 
 	if (args[0] == 'c') {
 		armed = 1;
-		rdi_count = 0;
+		dumped = 0;
+		frame_count = 0;
 
 		pr_info("cam-raw-dump: armed\n");
 		compat_copy_to_user(out_msg, "armed", 6);
@@ -259,9 +299,10 @@ static long cam_kpm_control0(
 
 		pr_info(
 			"cam-raw-dump: stopped "
-			"hooks=%u rdi=%u\n",
+			"hooks=%u frames=%u dumped=%d\n",
 			hook_count,
-			rdi_count);
+			frame_count,
+			dumped);
 
 		compat_copy_to_user(out_msg, "stopped", 8);
 	}
