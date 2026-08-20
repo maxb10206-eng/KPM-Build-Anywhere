@@ -5,14 +5,17 @@
 #include <hook.h>
 
 KPM_NAME("cam-raw-dump");
-KPM_VERSION("1.6.4");
+KPM_VERSION("1.6.5");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI0 dma_buf 64-byte read probe");
+KPM_DESCRIPTION("RDI0 64KB chunk capture probe");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
 #define MAX_RES 32
+
+#define CHUNK_SIZE (64 * 1024)
+#define TEST_SIZE  (1 * 1024 * 1024)
 
 struct dma_buf;
 
@@ -128,6 +131,18 @@ static void (*p_dma_buf_vunmap)(
 	struct dma_buf *,
 	void *);
 
+static void *(*p_vmalloc)(unsigned long);
+static void (*p_vfree)(const void *);
+
+static void *(*p_filp_open)(
+	const char *, int, unsigned int);
+
+static long (*p_kernel_write)(
+	void *, const void *, unsigned long, long long *);
+
+static int (*p_filp_close)(
+	void *, void *);
+
 static volatile int armed;
 static volatile int done_seen;
 
@@ -137,10 +152,24 @@ static volatile int saved_fd;
 static volatile unsigned int saved_handle;
 static volatile unsigned long long saved_request;
 
+static volatile unsigned int saved_width;
+static volatile unsigned int saved_height;
+static volatile unsigned int saved_stride;
+static volatile unsigned int saved_slice;
+static volatile unsigned int saved_format;
+
+static unsigned char *dyn_buf;
+static volatile unsigned long cached_len;
+
 static volatile unsigned int prepare_count;
 static volatile unsigned int done_count;
+static volatile unsigned int copy_ok;
+static volatile unsigned int copy_fail;
 
-static volatile int test_result;
+static int is_err_ptr(void *ptr)
+{
+	return (unsigned long)ptr >= (unsigned long)-4095;
+}
 
 static void before_prepare(
 	hook_fargs2_t *args,
@@ -173,6 +202,7 @@ static void before_prepare(
 			packet->io_configs_offset);
 
 	for (i = 0; i < packet->num_io_configs; i++) {
+
 		if (io_cfg[i].direction != CAM_BUF_OUTPUT)
 			continue;
 
@@ -198,24 +228,44 @@ static void before_prepare(
 				"FAILED fd=%d\n",
 				fd);
 
-			test_result = -1;
 			return;
 		}
 
 		saved_dmabuf = dmabuf;
 		saved_fd = fd;
 		saved_handle = handle;
-		saved_request = packet->header.request_id;
+		saved_request =
+			packet->header.request_id;
+
+		saved_width =
+			io_cfg[i].planes[0].width;
+
+		saved_height =
+			io_cfg[i].planes[0].height;
+
+		saved_stride =
+			io_cfg[i].planes[0].plane_stride;
+
+		saved_slice =
+			io_cfg[i].planes[0].slice_height;
+
+		saved_format =
+			io_cfg[i].format;
 
 		prepare_count++;
 
 		pr_info(
 			"cam-raw-dump: PREP saved "
 			"req=%llu mem=0x%x fd=%d "
+			"w=%u h=%u stride=%u slice=%u "
 			"dmabuf=%p\n",
 			saved_request,
 			saved_handle,
 			saved_fd,
+			saved_width,
+			saved_height,
+			saved_stride,
+			saved_slice,
 			saved_dmabuf);
 
 		return;
@@ -246,7 +296,8 @@ static void before_buf_done(
 		(struct kp_cam_isp_hw_compdone_event_info *)
 		event_info->event_data;
 
-	num_res = compdone->num_res;
+	num_res =
+		compdone->num_res;
 
 	if (num_res > MAX_RES)
 		num_res = MAX_RES;
@@ -254,6 +305,7 @@ static void before_buf_done(
 	done_count++;
 
 	for (i = 0; i < num_res; i++) {
+
 		if (compdone->res_id[i] != RDI_0)
 			continue;
 
@@ -262,46 +314,144 @@ static void before_buf_done(
 		pr_info(
 			"cam-raw-dump: DONE "
 			"req=%llu mem=0x%x fd=%d "
-			"dmabuf=%p\n",
+			"w=%u h=%u stride=%u slice=%u\n",
 			saved_request,
 			saved_handle,
 			saved_fd,
-			saved_dmabuf);
+			saved_width,
+			saved_height,
+			saved_stride,
+			saved_slice);
 
 		return;
 	}
 }
 
-static void print_64_bytes(
-	const unsigned char *p)
+static int capture_1mb(void)
 {
-	unsigned int i;
+	void *vaddr;
+	unsigned long copied;
+	unsigned long remaining;
+	unsigned long chunk;
+	int rc;
 
-	for (i = 0; i < 64; i += 16) {
-		pr_info(
-			"cam-raw-dump: DATA %02u: "
-			"%02x %02x %02x %02x "
-			"%02x %02x %02x %02x "
-			"%02x %02x %02x %02x "
-			"%02x %02x %02x %02x\n",
-			i,
-			p[i + 0],
-			p[i + 1],
-			p[i + 2],
-			p[i + 3],
-			p[i + 4],
-			p[i + 5],
-			p[i + 6],
-			p[i + 7],
-			p[i + 8],
-			p[i + 9],
-			p[i + 10],
-			p[i + 11],
-			p[i + 12],
-			p[i + 13],
-			p[i + 14],
-			p[i + 15]);
+	if (!saved_dmabuf ||
+	    !dyn_buf ||
+	    !done_seen)
+		return -1;
+
+	rc =
+		p_dma_buf_begin_cpu_access(
+			saved_dmabuf,
+			0);
+
+	pr_info(
+		"cam-raw-dump: begin_cpu_access rc=%d\n",
+		rc);
+
+	if (rc)
+		return rc;
+
+	vaddr =
+		p_dma_buf_vmap(
+			saved_dmabuf);
+
+	pr_info(
+		"cam-raw-dump: vmap=%lx\n",
+		(unsigned long)vaddr);
+
+	if (!vaddr) {
+		p_dma_buf_end_cpu_access(
+			saved_dmabuf,
+			0);
+
+		return -1;
 	}
+
+	copied = 0;
+	remaining = TEST_SIZE;
+
+	while (remaining) {
+
+		chunk = remaining;
+
+		if (chunk > CHUNK_SIZE)
+			chunk = CHUNK_SIZE;
+
+		memcpy(
+			dyn_buf + copied,
+			(unsigned char *)vaddr + copied,
+			chunk);
+
+		copied += chunk;
+		remaining -= chunk;
+	}
+
+	p_dma_buf_vunmap(
+		saved_dmabuf,
+		vaddr);
+
+	rc =
+		p_dma_buf_end_cpu_access(
+			saved_dmabuf,
+			0);
+
+	pr_info(
+		"cam-raw-dump: chunk copy done "
+		"bytes=%lu chunks=%lu "
+		"end_cpu_access rc=%d\n",
+		copied,
+		TEST_SIZE / CHUNK_SIZE,
+		rc);
+
+	if (rc)
+		return rc;
+
+	cached_len = copied;
+	copy_ok++;
+
+	return 0;
+}
+
+static int write_cached_frame(void)
+{
+	void *file;
+	long long pos = 0;
+	long written;
+
+	if (!dyn_buf ||
+	    !cached_len)
+		return -1;
+
+	file =
+		p_filp_open(
+			"/data/local/tmp/rdi0_1mb.raw",
+			1 | 256 | 512,
+			0644);
+
+	if (is_err_ptr(file))
+		return -1;
+
+	written =
+		p_kernel_write(
+			file,
+			dyn_buf,
+			cached_len,
+			&pos);
+
+	p_filp_close(
+		file,
+		NULL);
+
+	pr_info(
+		"cam-raw-dump: written=%ld expected=%lu\n",
+		written,
+		cached_len);
+
+	return
+		(written == (long)cached_len)
+		? 0
+		: -1;
 }
 
 static long cam_kpm_init(
@@ -341,17 +491,25 @@ static long cam_kpm_init(
 		(void *)kallsyms_lookup_name(
 			"dma_buf_vunmap");
 
-	pr_info(
-		"cam-raw-dump: prepare=%lx "
-		"buf_done=%lx get=%p begin=%p "
-		"end=%p vmap=%p vunmap=%p\n",
-		addr_prepare,
-		addr_buf_done,
-		p_dma_buf_get,
-		p_dma_buf_begin_cpu_access,
-		p_dma_buf_end_cpu_access,
-		p_dma_buf_vmap,
-		p_dma_buf_vunmap);
+	p_vmalloc =
+		(void *)kallsyms_lookup_name(
+			"vmalloc");
+
+	p_vfree =
+		(void *)kallsyms_lookup_name(
+			"vfree");
+
+	p_filp_open =
+		(void *)kallsyms_lookup_name(
+			"filp_open");
+
+	p_kernel_write =
+		(void *)kallsyms_lookup_name(
+			"kernel_write");
+
+	p_filp_close =
+		(void *)kallsyms_lookup_name(
+			"filp_close");
 
 	if (!addr_prepare ||
 	    !addr_buf_done ||
@@ -360,7 +518,23 @@ static long cam_kpm_init(
 	    !p_dma_buf_begin_cpu_access ||
 	    !p_dma_buf_end_cpu_access ||
 	    !p_dma_buf_vmap ||
-	    !p_dma_buf_vunmap)
+	    !p_dma_buf_vunmap ||
+	    !p_vmalloc ||
+	    !p_vfree ||
+	    !p_filp_open ||
+	    !p_kernel_write ||
+	    !p_filp_close)
+		return -1;
+
+	dyn_buf =
+		p_vmalloc(TEST_SIZE);
+
+	pr_info(
+		"cam-raw-dump: dyn_buf=%p size=%d\n",
+		dyn_buf,
+		TEST_SIZE);
+
+	if (!dyn_buf)
 		return -1;
 
 	if (hook_wrap2(
@@ -394,7 +568,6 @@ static long cam_kpm_control0(
 	int outlen)
 {
 	int rc;
-	void *vaddr;
 
 	if (!args)
 		return -1;
@@ -402,20 +575,24 @@ static long cam_kpm_control0(
 	if (args[0] == 'c') {
 
 		if (saved_dmabuf) {
-			p_dma_buf_put(saved_dmabuf);
+			p_dma_buf_put(
+				saved_dmabuf);
+
 			saved_dmabuf = NULL;
 		}
 
 		armed = 1;
 		done_seen = 0;
+		cached_len = 0;
 
 		saved_fd = -1;
 		saved_handle = 0;
 		saved_request = 0;
 
-		test_result = 0;
 		prepare_count = 0;
 		done_count = 0;
+		copy_ok = 0;
+		copy_fail = 0;
 
 		pr_info(
 			"cam-raw-dump: armed\n");
@@ -429,7 +606,8 @@ static long cam_kpm_control0(
 
 		if (!saved_dmabuf) {
 			pr_info(
-				"cam-raw-dump: no saved dma_buf\n");
+				"cam-raw-dump: "
+				"no saved dma_buf\n");
 
 			compat_copy_to_user(
 				out_msg,
@@ -453,91 +631,55 @@ static long cam_kpm_control0(
 		}
 
 		pr_info(
-			"cam-raw-dump: READ64 begin "
-			"dmabuf=%p fd=%d req=%llu\n",
-			saved_dmabuf,
-			saved_fd,
-			saved_request);
+			"cam-raw-dump: "
+			"1MB chunk capture begin\n");
 
 		rc =
-			p_dma_buf_begin_cpu_access(
-				saved_dmabuf,
-				0);
+			capture_1mb();
 
-		pr_info(
-			"cam-raw-dump: "
-			"begin_cpu_access rc=%d\n",
-			rc);
-
-		if (rc) {
-			test_result = rc;
-
+		if (!rc) {
 			compat_copy_to_user(
 				out_msg,
-				"begin_fail",
+				"capture_ok",
 				11);
-
-			return 0;
-		}
-
-		vaddr =
-			p_dma_buf_vmap(
-				saved_dmabuf);
-
-		pr_info(
-			"cam-raw-dump: "
-			"vmap result=%lx\n",
-			(unsigned long)vaddr);
-
-		if (!vaddr) {
-			test_result = -1;
-
-			p_dma_buf_end_cpu_access(
-				saved_dmabuf,
-				0);
+		} else {
+			copy_fail++;
 
 			compat_copy_to_user(
 				out_msg,
-				"vmap_fail",
-				10);
+				"capture_fail",
+				13);
+		}
+
+	} else if (args[0] == 'w') {
+
+		if (!cached_len) {
+			pr_info(
+				"cam-raw-dump: "
+				"no captured data\n");
+
+			compat_copy_to_user(
+				out_msg,
+				"no_data",
+				8);
 
 			return 0;
 		}
 
-		/*
-		 * 只读取 64 字节。
-		 * 不做整帧 memcpy。
-		 */
-		print_64_bytes(
-			(const unsigned char *)vaddr);
-
-		pr_info(
-			"cam-raw-dump: "
-			"read64 ok\n");
-
-		p_dma_buf_vunmap(
-			saved_dmabuf,
-			vaddr);
-
-		pr_info(
-			"cam-raw-dump: vunmap ok\n");
-
 		rc =
-			p_dma_buf_end_cpu_access(
-				saved_dmabuf,
-				0);
+			write_cached_frame();
 
-		test_result = rc;
-
-		pr_info(
-			"cam-raw-dump: "
-			"end_cpu_access rc=%d\n",
-			rc);
-
-		compat_copy_to_user(
-			out_msg,
-			"read64_ok",
-			10);
+		if (!rc) {
+			compat_copy_to_user(
+				out_msg,
+				"write_ok",
+				9);
+		} else {
+			compat_copy_to_user(
+				out_msg,
+				"write_fail",
+				11);
+		}
 
 	} else if (args[0] == 's') {
 
@@ -546,10 +688,13 @@ static long cam_kpm_control0(
 		pr_info(
 			"cam-raw-dump: STOP "
 			"prepare=%u done=%u "
-			"result=%d dmabuf=%p\n",
+			"copy_ok=%u copy_fail=%u "
+			"cached=%lu dmabuf=%p\n",
 			prepare_count,
 			done_count,
-			test_result,
+			copy_ok,
+			copy_fail,
+			cached_len,
 			saved_dmabuf);
 
 		if (saved_dmabuf) {
@@ -586,7 +731,13 @@ static long cam_kpm_exit(
 		p_dma_buf_put(
 			saved_dmabuf);
 
+	if (dyn_buf &&
+	    p_vfree)
+		p_vfree(
+			dyn_buf);
+
 	saved_dmabuf = NULL;
+	dyn_buf = NULL;
 
 	pr_info(
 		"cam-raw-dump: exit\n");
