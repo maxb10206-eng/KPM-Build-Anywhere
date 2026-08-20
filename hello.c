@@ -5,18 +5,18 @@
 #include <hook.h>
 
 KPM_NAME("cam-raw-dump");
-KPM_VERSION("1.3.5");
+KPM_VERSION("1.3.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI0 first-frame RAW dump");
+KPM_DESCRIPTION("RDI CPU vmap probe");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
-
-#define MAX_CAPTURE_SIZE (64UL * 1024 * 1024)
+#define RDI_1 0x3007
+#define RDI_2 0x3008
+#define RDI_3 0x3009
 
 struct dma_buf;
-struct file;
 
 struct kp_cam_packet_header {
 	unsigned int op_code;
@@ -40,18 +40,7 @@ struct kp_cam_packet {
 };
 
 struct kp_cam_plane_cfg {
-	unsigned int width;
-	unsigned int height;
-	unsigned int plane_stride;
-	unsigned int slice_height;
-	unsigned int meta_stride;
-	unsigned int meta_size;
-	unsigned int meta_offset;
-	unsigned int packer_config;
-	unsigned int mode_config;
-	unsigned int tile_config;
-	unsigned int h_init;
-	unsigned int v_init;
+	unsigned int v[12];
 };
 
 struct kp_cam_cmd_buf_desc {
@@ -66,21 +55,16 @@ struct kp_cam_cmd_buf_desc {
 struct kp_cam_buf_io_cfg {
 	int mem_handle[3];
 	unsigned int offsets[3];
-
 	struct kp_cam_plane_cfg planes[3];
-
 	unsigned int format;
 	unsigned int color_space;
 	unsigned int color_pattern;
 	unsigned int bpp;
 	unsigned int rotation;
 	unsigned int resource_type;
-
 	int fence;
 	int early_fence;
-
 	struct kp_cam_cmd_buf_desc aux_cmd_buf;
-
 	unsigned int direction;
 	unsigned int batch_size;
 	unsigned int subsample_pattern;
@@ -98,105 +82,45 @@ static unsigned long addr_begin_cpu;
 static unsigned long addr_end_cpu;
 static unsigned long addr_vmap;
 static unsigned long addr_vunmap;
-static unsigned long addr_filp_open;
-static unsigned long addr_filp_close;
-static unsigned long addr_kernel_write;
 
-static struct dma_buf *(*kp_dma_buf_get)(int);
-static void (*kp_dma_buf_put)(struct dma_buf *);
+static struct dma_buf *(*kp_dma_buf_get)(int fd);
+static void (*kp_dma_buf_put)(struct dma_buf *buf);
 
-static int (*kp_begin_cpu)(struct dma_buf *, int);
-static int (*kp_end_cpu)(struct dma_buf *, int);
+static int (*kp_begin_cpu)(
+	struct dma_buf *buf, int direction);
 
-static void *(*kp_vmap)(struct dma_buf *);
-static void (*kp_vunmap)(struct dma_buf *, void *);
+static int (*kp_end_cpu)(
+	struct dma_buf *buf, int direction);
 
-static struct file *(*kp_filp_open)(
-	const char *, int, unsigned int);
+static void *(*kp_vmap)(
+	struct dma_buf *buf);
 
-static int (*kp_filp_close)(
-	struct file *, void *);
-
-static long (*kp_kernel_write)(
-	struct file *,
-	const void *,
-	unsigned long,
-	long long *);
+static void (*kp_vunmap)(
+	struct dma_buf *buf,
+	void *vaddr);
 
 static volatile int armed;
-static volatile int captured;
+static volatile int dumped;
+static volatile unsigned int hook_count;
+static volatile unsigned int frame_count;
 
-static void write_frame(
-	void *vaddr,
-	unsigned long len,
-	unsigned long request_id)
-{
-	struct file *file;
-	long long pos = 0;
-	long rc;
-
-	if (!vaddr || !len)
-		return;
-
-	if (!kp_filp_open ||
-	    !kp_filp_close ||
-	    !kp_kernel_write)
-		return;
-
-	file = kp_filp_open(
-		"/data/local/tmp/rdi0.raw",
-		1 | 64 | 512,
-		0600);
-
-	if (!file) {
-		pr_info(
-			"cam-raw-dump: open failed\n");
-		return;
-	}
-
-	rc = kp_kernel_write(
-		file,
-		vaddr,
-		len,
-		&pos);
-
-	pr_info(
-		"cam-raw-dump: write rc=%ld "
-		"len=%lu req=%lu\n",
-		rc,
-		len,
-		request_id);
-
-	kp_filp_close(
-		file,
-		NULL);
-}
-
-static void before_prepare(
-	hook_fargs2_t *args,
-	void *udata)
+static void before_prepare(hook_fargs2_t *args, void *udata)
 {
 	struct kp_cam_packet *packet;
 	struct kp_cam_buf_io_cfg *io_cfg;
 	struct dma_buf *buf;
 	void *vaddr;
-
 	unsigned int i;
 	unsigned int handle;
 	unsigned int fd;
-
-	unsigned long len;
-	unsigned long stride;
-	unsigned long height;
-
 	int rc;
 
-	if (!armed || captured)
+	hook_count++;
+
+	if (!armed || dumped)
 		return;
 
-	packet =
-		*(struct kp_cam_packet **)args->arg1;
-
+	packet = *(struct kp_cam_packet **)args->arg1;
 	if (!packet)
 		return;
 
@@ -204,15 +128,11 @@ static void before_prepare(
 	    packet->num_io_configs > 64)
 		return;
 
-	io_cfg =
-		(struct kp_cam_buf_io_cfg *)(
-			(unsigned char *)packet->payload +
-			packet->io_configs_offset);
+	io_cfg = (struct kp_cam_buf_io_cfg *)(
+		(unsigned char *)packet->payload +
+		packet->io_configs_offset);
 
-	for (i = 0;
-	     i < packet->num_io_configs;
-	     i++) {
-
+	for (i = 0; i < packet->num_io_configs; i++) {
 		if (io_cfg[i].direction != CAM_BUF_OUTPUT)
 			continue;
 
@@ -222,106 +142,53 @@ static void before_prepare(
 		if (!io_cfg[i].mem_handle[0])
 			continue;
 
-		stride =
-			io_cfg[i].planes[0].plane_stride;
+		frame_count++;
 
-		height =
-			io_cfg[i].planes[0].slice_height;
-
-		if (!height)
-			height =
-				io_cfg[i].planes[0].height;
-
-		len = stride * height;
-
-		pr_info(
-			"cam-raw-dump: RDI0 req=%llu "
-			"width=%u height=%u stride=%u "
-			"slice=%u len=%lu format=%u\n",
-			packet->header.request_id,
-			io_cfg[i].planes[0].width,
-			io_cfg[i].planes[0].height,
-			io_cfg[i].planes[0].plane_stride,
-			io_cfg[i].planes[0].slice_height,
-			len,
-			io_cfg[i].format);
-
-		if (!len || len > MAX_CAPTURE_SIZE) {
-			pr_info(
-				"cam-raw-dump: invalid frame len=%lu\n",
-				len);
-			return;
-		}
-
-		handle =
-			(unsigned int)
-			io_cfg[i].mem_handle[0];
-
+		handle = (unsigned int)io_cfg[i].mem_handle[0];
 		fd = handle >> 16;
 
-		buf =
-			kp_dma_buf_get((int)fd);
+		pr_info(
+			"cam-raw-dump: RDI0 req=%llu mem=0x%x fd=%u\n",
+			packet->header.request_id,
+			handle,
+			fd);
 
+		buf = kp_dma_buf_get((int)fd);
 		if (!buf) {
 			pr_info(
-				"cam-raw-dump: dma_buf_get "
-				"failed fd=%u\n",
+				"cam-raw-dump: dma_buf_get failed fd=%u\n",
 				fd);
 			return;
 		}
 
-		rc =
-			kp_begin_cpu(buf, 0);
-
+		rc = kp_begin_cpu(buf, 0);
 		if (rc) {
 			pr_info(
-				"cam-raw-dump: begin_cpu rc=%d\n",
+				"cam-raw-dump: begin_cpu_access failed rc=%d\n",
 				rc);
-
 			kp_dma_buf_put(buf);
 			return;
 		}
 
-		vaddr =
-			kp_vmap(buf);
+		vaddr = kp_vmap(buf);
 
-		if (!vaddr) {
-			pr_info(
-				"cam-raw-dump: vmap failed\n");
+		pr_info(
+			"cam-raw-dump: RDI0 vmap rc=%d vaddr=%lx\n",
+			vaddr ? 0 : -1,
+			(unsigned long)vaddr);
 
-			kp_end_cpu(buf, 0);
-			kp_dma_buf_put(buf);
-			return;
+		if (vaddr) {
+			/*
+			 * 这里只验证映射成功。
+			 * 暂时不读取和不修改 buffer。
+			 */
+			dumped = 1;
+
+			kp_vunmap(buf, vaddr);
 		}
 
-		pr_info(
-			"cam-raw-dump: vmap=%lx "
-			"capturing=%lu bytes\n",
-			(unsigned long)vaddr,
-			len);
-
-		captured = 1;
-		armed = 0;
-
-		write_frame(
-			vaddr,
-			len,
-			(unsigned long)
-			packet->header.request_id);
-
-		kp_vunmap(
-			buf,
-			vaddr);
-
-		kp_end_cpu(
-			buf,
-			0);
-
-		kp_dma_buf_put(
-			buf);
-
-		pr_info(
-			"cam-raw-dump: capture done\n");
+		kp_end_cpu(buf, 0);
+		kp_dma_buf_put(buf);
 
 		return;
 	}
@@ -337,12 +204,10 @@ static long cam_kpm_init(
 			"cam_ife_mgr_prepare_hw_update");
 
 	addr_dma_buf_get =
-		kallsyms_lookup_name(
-			"dma_buf_get");
+		kallsyms_lookup_name("dma_buf_get");
 
 	addr_dma_buf_put =
-		kallsyms_lookup_name(
-			"dma_buf_put");
+		kallsyms_lookup_name("dma_buf_put");
 
 	addr_begin_cpu =
 		kallsyms_lookup_name(
@@ -353,34 +218,21 @@ static long cam_kpm_init(
 			"dma_buf_end_cpu_access");
 
 	addr_vmap =
-		kallsyms_lookup_name(
-			"dma_buf_vmap");
+		kallsyms_lookup_name("dma_buf_vmap");
 
 	addr_vunmap =
-		kallsyms_lookup_name(
-			"dma_buf_vunmap");
-
-	addr_filp_open =
-		kallsyms_lookup_name(
-			"filp_open");
-
-	addr_filp_close =
-		kallsyms_lookup_name(
-			"filp_close");
-
-	addr_kernel_write =
-		kallsyms_lookup_name(
-			"kernel_write");
+		kallsyms_lookup_name("dma_buf_vunmap");
 
 	pr_info(
-		"cam-raw-dump: "
-		"prepare=%lx get=%lx begin=%lx "
-		"vmap=%lx write=%lx\n",
+		"cam-raw-dump: prepare=%lx get=%lx put=%lx "
+		"begin=%lx end=%lx vmap=%lx vunmap=%lx\n",
 		addr_prepare,
 		addr_dma_buf_get,
+		addr_dma_buf_put,
 		addr_begin_cpu,
+		addr_end_cpu,
 		addr_vmap,
-		addr_kernel_write);
+		addr_vunmap);
 
 	if (!addr_prepare ||
 	    !addr_dma_buf_get ||
@@ -388,10 +240,7 @@ static long cam_kpm_init(
 	    !addr_begin_cpu ||
 	    !addr_end_cpu ||
 	    !addr_vmap ||
-	    !addr_vunmap ||
-	    !addr_filp_open ||
-	    !addr_filp_close ||
-	    !addr_kernel_write)
+	    !addr_vunmap)
 		return -1;
 
 	kp_dma_buf_get =
@@ -418,24 +267,6 @@ static long cam_kpm_init(
 		(void (*)(struct dma_buf *, void *))
 		(void *)addr_vunmap;
 
-	kp_filp_open =
-		(struct file *(*)(const char *,
-				  int,
-				  unsigned int))
-		(void *)addr_filp_open;
-
-	kp_filp_close =
-		(int (*)(struct file *,
-			 void *))
-		(void *)addr_filp_close;
-
-	kp_kernel_write =
-		(long (*)(struct file *,
-			  const void *,
-			  unsigned long,
-			  long long *))
-		(void *)addr_kernel_write;
-
 	if (hook_wrap2(
 		(void *)addr_prepare,
 		before_prepare,
@@ -443,9 +274,7 @@ static long cam_kpm_init(
 		NULL))
 		return -1;
 
-	pr_info(
-		"cam-raw-dump: init ok\n");
-
+	pr_info("cam-raw-dump: init ok\n");
 	return 0;
 }
 
@@ -458,48 +287,35 @@ static long cam_kpm_control0(
 		return -1;
 
 	if (args[0] == 'c') {
-
 		armed = 1;
-		captured = 0;
+		dumped = 0;
+		frame_count = 0;
 
-		pr_info(
-			"cam-raw-dump: armed\n");
-
-		compat_copy_to_user(
-			out_msg,
-			"armed",
-			6);
+		pr_info("cam-raw-dump: armed\n");
+		compat_copy_to_user(out_msg, "armed", 6);
 
 	} else if (args[0] == 's') {
-
 		armed = 0;
 
 		pr_info(
 			"cam-raw-dump: stopped "
-			"captured=%d\n",
-			captured);
+			"hooks=%u frames=%u dumped=%d\n",
+			hook_count,
+			frame_count,
+			dumped);
 
-		compat_copy_to_user(
-			out_msg,
-			"stopped",
-			8);
+		compat_copy_to_user(out_msg, "stopped", 8);
 	}
 
 	return 0;
 }
 
-static long cam_kpm_exit(
-	void *reserved)
+static long cam_kpm_exit(void *reserved)
 {
-	armed = 0;
-
 	if (addr_prepare)
-		unhook(
-			(void *)addr_prepare);
+		unhook((void *)addr_prepare);
 
-	pr_info(
-		"cam-raw-dump: exit\n");
-
+	pr_info("cam-raw-dump: exit\n");
 	return 0;
 }
 
