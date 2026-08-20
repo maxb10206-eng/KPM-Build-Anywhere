@@ -2,9 +2,6 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/slab.h>
-#include <linux/workqueue.h>
-#include <linux/dma-buf.h>
 #include <kputils.h>
 #include <hook.h>
 
@@ -12,12 +9,15 @@ KPM_NAME("cam-raw-dump");
 KPM_VERSION("1.3.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("RDI0 first-frame RAW dump");
+KPM_DESCRIPTION("RDI0 first-frame capture");
 
 #define CAM_BUF_OUTPUT 2
 #define RDI_0 0x3006
 
 #define MAX_CAPTURE_SIZE (64UL * 1024 * 1024)
+
+struct dma_buf;
+struct file;
 
 struct kp_cam_packet_header {
 	unsigned int op_code;
@@ -57,15 +57,19 @@ struct kp_cam_buf_io_cfg {
 	int mem_handle[3];
 	unsigned int offsets[3];
 	struct kp_cam_plane_cfg planes[3];
+
 	unsigned int format;
 	unsigned int color_space;
 	unsigned int color_pattern;
 	unsigned int bpp;
 	unsigned int rotation;
 	unsigned int resource_type;
+
 	int fence;
 	int early_fence;
+
 	struct kp_cam_cmd_buf_desc aux_cmd_buf;
+
 	unsigned int direction;
 	unsigned int batch_size;
 	unsigned int subsample_pattern;
@@ -83,50 +87,75 @@ static unsigned long addr_begin_cpu;
 static unsigned long addr_end_cpu;
 static unsigned long addr_vmap;
 static unsigned long addr_vunmap;
+
 static unsigned long addr_filp_open;
 static unsigned long addr_filp_close;
 static unsigned long addr_kernel_write;
 
-static struct dma_buf *(*kp_dma_buf_get)(int);
-static void (*kp_dma_buf_put)(struct dma_buf *);
+static struct dma_buf *(*kp_dma_buf_get)(int fd);
+static void (*kp_dma_buf_put)(struct dma_buf *buf);
 
-static int (*kp_begin_cpu)(struct dma_buf *, int);
-static int (*kp_end_cpu)(struct dma_buf *, int);
+static int (*kp_begin_cpu)(
+	struct dma_buf *buf,
+	int direction);
 
-static void *(*kp_vmap)(struct dma_buf *);
-static void (*kp_vunmap)(struct dma_buf *, void *);
+static int (*kp_end_cpu)(
+	struct dma_buf *buf,
+	int direction);
+
+static void *(*kp_vmap)(
+	struct dma_buf *buf);
+
+static void (*kp_vunmap)(
+	struct dma_buf *buf,
+	void *vaddr);
 
 static struct file *(*kp_filp_open)(
-	const char *, int, umode_t);
+	const char *filename,
+	int flags,
+	unsigned int mode);
 
 static int (*kp_filp_close)(
-	struct file *, fl_owner_t);
+	struct file *file,
+	void *id);
 
-static ssize_t (*kp_kernel_write)(
-	struct file *, const void *, size_t, loff_t *);
+static long (*kp_kernel_write)(
+	struct file *file,
+	const void *buf,
+	unsigned long count,
+	long long *pos);
 
 static volatile int armed;
 static volatile int captured;
 
 static void *capture_buf;
-static size_t capture_len;
-static struct work_struct capture_work;
+static unsigned long capture_len;
 
-static void write_capture(struct work_struct *work)
+static volatile unsigned int hook_count;
+
+static void write_capture(void)
 {
 	struct file *file;
-	loff_t pos = 0;
-	ssize_t rc;
+	long long pos = 0;
+	long rc;
 
-	if (!capture_buf || !capture_len)
+	if (!capture_buf || !capture_len) {
+		pr_info(
+			"cam-raw-dump: no captured buffer\n");
 		return;
+	}
 
-	if (!kp_filp_open || !kp_kernel_write || !kp_filp_close)
+	if (!kp_filp_open ||
+	    !kp_filp_close ||
+	    !kp_kernel_write) {
+		pr_info(
+			"cam-raw-dump: file API unavailable\n");
 		return;
+	}
 
 	file = kp_filp_open(
 		"/data/local/tmp/rdi0.raw",
-		O_WRONLY | O_CREAT | O_TRUNC,
+		1 | 64 | 512,
 		0600);
 
 	if (IS_ERR(file)) {
@@ -142,8 +171,9 @@ static void write_capture(struct work_struct *work)
 		&pos);
 
 	pr_info(
-		"cam-raw-dump: write rc=%ld len=%zu\n",
-		(long)rc,
+		"cam-raw-dump: write rc=%ld "
+		"expected=%lu\n",
+		rc,
 		capture_len);
 
 	kp_filp_close(file, NULL);
@@ -158,13 +188,16 @@ static void before_prepare(
 
 	struct dma_buf *buf;
 	void *vaddr;
+	void *dst;
 
 	unsigned int i;
 	unsigned int handle;
 	unsigned int fd;
 
-	size_t len;
+	unsigned long len;
 	int rc;
+
+	hook_count++;
 
 	if (!armed || captured)
 		return;
@@ -208,11 +241,12 @@ static void before_prepare(
 			handle,
 			fd);
 
-		buf = kp_dma_buf_get(fd);
+		buf = kp_dma_buf_get((int)fd);
 
 		if (!buf) {
 			pr_info(
-				"cam-raw-dump: dma_buf_get failed\n");
+				"cam-raw-dump: "
+				"dma_buf_get failed\n");
 			return;
 		}
 
@@ -220,48 +254,84 @@ static void before_prepare(
 
 		if (rc) {
 			pr_info(
-				"cam-raw-dump: begin_cpu rc=%d\n",
+				"cam-raw-dump: "
+				"begin_cpu rc=%d\n",
 				rc);
 
 			kp_dma_buf_put(buf);
 			return;
 		}
 
-		len = buf->size;
-
-		pr_info(
-			"cam-raw-dump: buffer size=%zu\n",
-			len);
-
-		if (!len || len > MAX_CAPTURE_SIZE) {
-			pr_info(
-				"cam-raw-dump: invalid size=%zu\n",
-				len);
-
-			kp_end_cpu(buf, 0);
-			kp_dma_buf_put(buf);
-			return;
-		}
-
+		/*
+		 * dma_buf_vmap() 已经在 1.3.2
+		 * 成功验证过。
+		 */
 		vaddr = kp_vmap(buf);
 
 		if (!vaddr) {
 			pr_info(
-				"cam-raw-dump: vmap failed\n");
+				"cam-raw-dump: "
+				"vmap failed\n");
 
 			kp_end_cpu(buf, 0);
 			kp_dma_buf_put(buf);
 			return;
 		}
 
-		capture_buf = kmalloc(
+		/*
+		 * 第一版先限制最大捕获尺寸，
+		 * 防止异常 buffer 消耗过多内存。
+		 */
+		len = 0;
+
+		/*
+		 * dma_buf 的 size 在目标内核中
+		 * 已确认存在。
+		 */
+		{
+			unsigned long *p;
+
+			/*
+			 * struct dma_buf 的 size 是 size_t。
+			 * 这里不引入完整 linux/dma-buf.h，
+			 * 只读取已确认的 size 字段。
+			 */
+			p =
+				(unsigned long *)(
+					(unsigned char *)buf +
+					sizeof(void *) * 6);
+
+			len = *p;
+		}
+
+		pr_info(
+			"cam-raw-dump: "
+			"vmap=%lx len=%lu\n",
+			(unsigned long)vaddr,
+			len);
+
+		if (!len ||
+		    len > MAX_CAPTURE_SIZE) {
+
+			pr_info(
+				"cam-raw-dump: "
+				"invalid buffer size=%lu\n",
+				len);
+
+			kp_vunmap(buf, vaddr);
+			kp_end_cpu(buf, 0);
+			kp_dma_buf_put(buf);
+			return;
+		}
+
+		dst = kmalloc(
 			len,
 			GFP_KERNEL);
 
-		if (!capture_buf) {
+		if (!dst) {
 			pr_info(
-				"cam-raw-dump: kmalloc failed "
-				"size=%zu\n",
+				"cam-raw-dump: "
+				"kmalloc failed size=%lu\n",
 				len);
 
 			kp_vunmap(buf, vaddr);
@@ -271,22 +341,23 @@ static void before_prepare(
 		}
 
 		memcpy(
-			capture_buf,
+			dst,
 			vaddr,
 			len);
 
+		capture_buf = dst;
 		capture_len = len;
 		captured = 1;
+		armed = 0;
 
 		pr_info(
-			"cam-raw-dump: captured %zu bytes\n",
+			"cam-raw-dump: "
+			"captured %lu bytes\n",
 			len);
 
 		kp_vunmap(buf, vaddr);
 		kp_end_cpu(buf, 0);
 		kp_dma_buf_put(buf);
-
-		schedule_work(&capture_work);
 
 		return;
 	}
@@ -302,10 +373,12 @@ static long cam_kpm_init(
 			"cam_ife_mgr_prepare_hw_update");
 
 	addr_dma_buf_get =
-		kallsyms_lookup_name("dma_buf_get");
+		kallsyms_lookup_name(
+			"dma_buf_get");
 
 	addr_dma_buf_put =
-		kallsyms_lookup_name("dma_buf_put");
+		kallsyms_lookup_name(
+			"dma_buf_put");
 
 	addr_begin_cpu =
 		kallsyms_lookup_name(
@@ -336,8 +409,9 @@ static long cam_kpm_init(
 			"kernel_write");
 
 	pr_info(
-		"cam-raw-dump: prepare=%lx get=%lx "
-		"begin=%lx vmap=%lx write=%lx\n",
+		"cam-raw-dump: "
+		"prepare=%lx get=%lx begin=%lx "
+		"vmap=%lx write=%lx\n",
 		addr_prepare,
 		addr_dma_buf_get,
 		addr_begin_cpu,
@@ -381,23 +455,19 @@ static long cam_kpm_init(
 		(void *)addr_vunmap;
 
 	kp_filp_open =
-		(struct file *(*)(const char *, int, umode_t))
+		(struct file *(*)(const char *, int, unsigned int))
 		(void *)addr_filp_open;
 
 	kp_filp_close =
-		(int (*)(struct file *, fl_owner_t))
+		(int (*)(struct file *, void *))
 		(void *)addr_filp_close;
 
 	kp_kernel_write =
-		(ssize_t (*)(struct file *,
-			     const void *,
-			     size_t,
-			     loff_t *))
+		(long (*)(struct file *,
+			  const void *,
+			  unsigned long,
+			  long long *))
 		(void *)addr_kernel_write;
-
-	INIT_WORK(
-		&capture_work,
-		write_capture);
 
 	if (hook_wrap2(
 		(void *)addr_prepare,
@@ -439,13 +509,25 @@ static long cam_kpm_control0(
 
 		pr_info(
 			"cam-raw-dump: stopped "
-			"captured=%d len=%zu\n",
+			"captured=%d len=%lu\n",
 			captured,
 			capture_len);
 
 		compat_copy_to_user(
 			out_msg,
 			"stopped",
+			8);
+
+	} else if (args[0] == 'w') {
+
+		pr_info(
+			"cam-raw-dump: writing capture\n");
+
+		write_capture();
+
+		compat_copy_to_user(
+			out_msg,
+			"written",
 			8);
 	}
 
@@ -458,9 +540,6 @@ static long cam_kpm_exit(
 	if (addr_prepare)
 		unhook(
 			(void *)addr_prepare);
-
-	cancel_work_sync(
-		&capture_work);
 
 	if (capture_buf) {
 		kfree(capture_buf);
