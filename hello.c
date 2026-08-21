@@ -6,10 +6,10 @@
 #include <hook.h>
 
 KPM_NAME("cam-preview-ubwc-probe");
-KPM_VERSION("1.8.2");
+KPM_VERSION("1.8.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Probe preview UBWC TP10 buffer");
+KPM_DESCRIPTION("Probe preview UBWC TP10 layout");
 
 #define CAM_BUF_OUTPUT 2
 #define PREVIEW_RES 0x3000
@@ -107,6 +107,7 @@ static void before_prepare(hook_fargs2_t *args,void *udata)
 {
     struct kp_cam_packet *p;
     struct kp_cam_buf_io_cfg *io;
+    struct kp_cam_plane_cfg *pl;
     struct dma_buf *dmabuf;
     unsigned int i,handle;
     int fd;
@@ -131,6 +132,8 @@ static void before_prepare(hook_fargs2_t *args,void *udata)
         if (!io[i].mem_handle[0])
             continue;
 
+        pl = &io[i].planes[0];
+
         handle = (unsigned int)io[i].mem_handle[0];
         fd = (int)(handle >> 16);
 
@@ -146,25 +149,50 @@ static void before_prepare(hook_fargs2_t *args,void *udata)
         saved_fd = fd;
         saved_handle = handle;
         saved_request = p->header.request_id;
-        saved_width = io[i].planes[0].width;
-        saved_height = io[i].planes[0].height;
-        saved_stride = io[i].planes[0].plane_stride;
-        saved_slice = io[i].planes[0].slice_height;
+        saved_width = pl->width;
+        saved_height = pl->height;
+        saved_stride = pl->plane_stride;
+        saved_slice = pl->slice_height;
         saved_offset = io[i].offsets[0];
         saved_format = io[i].format;
 
         pr_info(
-            "cam-preview: PREP saved req=%llu "
-            "fd=%d dmabuf=%p res=0x%x fmt=%u "
+            "cam-preview: PREP req=%llu fd=%d dmabuf=%p "
+            "res=0x%x fmt=%u\n",
+            saved_request,
+            saved_fd,
+            saved_dmabuf,
+            io[i].resource_type,
+            saved_format);
+
+        pr_info(
+            "cam-preview: GEOM "
             "w=%u h=%u stride=%u slice=%u off=%u "
             "main_bytes=%llu\n",
-            saved_request,saved_fd,saved_dmabuf,
-            io[i].resource_type,saved_format,
-            saved_width,saved_height,
-            saved_stride,saved_slice,
-            saved_offset,
-            (unsigned long long)saved_stride *
-            (unsigned long long)saved_slice);
+            pl->width,
+            pl->height,
+            pl->plane_stride,
+            pl->slice_height,
+            io[i].offsets[0],
+            (unsigned long long)pl->plane_stride *
+            (unsigned long long)pl->slice_height);
+
+        pr_info(
+            "cam-preview: META "
+            "stride=%u size=%u off=%u\n",
+            pl->meta_stride,
+            pl->meta_size,
+            pl->meta_offset);
+
+        pr_info(
+            "cam-preview: CFG "
+            "packer=0x%x mode=0x%x tile=0x%x "
+            "h_init=%u v_init=%u\n",
+            pl->packer_config,
+            pl->mode_config,
+            pl->tile_config,
+            pl->h_init,
+            pl->v_init);
 
         return;
     }
@@ -206,6 +234,7 @@ static void before_buf_done(hook_fargs2_t *args,void *udata)
             saved_request,
             saved_fd,
             compdone->last_consumed_addr[i]);
+
         return;
     }
 }
@@ -226,8 +255,7 @@ static int read_preview64(void)
 
     pr_info(
         "cam-preview: geometry bytes=%llu "
-        "w=%u h=%u stride=%u slice=%u "
-        "offset=%u\n",
+        "w=%u h=%u stride=%u slice=%u offset=%u\n",
         main_bytes,
         saved_width,
         saved_height,
@@ -283,8 +311,11 @@ static int read_preview64(void)
             data[i+12],data[i+13],data[i+14],data[i+15]);
     }
 
-    p_dma_buf_vunmap(saved_dmabuf,vaddr);
-    pr_info("cam-preview: vunmap ok\n");
+    p_dma_buf_vunmap(
+        saved_dmabuf,vaddr);
+
+    pr_info(
+        "cam-preview: vunmap ok\n");
 
     rc = p_dma_buf_end_cpu_access(
         saved_dmabuf,0);
@@ -341,18 +372,22 @@ static long cam_kpm_init(
         "cam-preview: prepare=%lx buf_done=%lx "
         "get=%lx begin=%lx end=%lx "
         "vmap=%lx vunmap=%lx\n",
-        addr_prepare,addr_buf_done,
+        addr_prepare,
+        addr_buf_done,
         (unsigned long)p_dma_buf_get,
         (unsigned long)p_dma_buf_begin_cpu_access,
         (unsigned long)p_dma_buf_end_cpu_access,
         (unsigned long)p_dma_buf_vmap,
         (unsigned long)p_dma_buf_vunmap);
 
-    if (!addr_prepare || !addr_buf_done ||
-        !p_dma_buf_get || !p_dma_buf_put ||
+    if (!addr_prepare ||
+        !addr_buf_done ||
+        !p_dma_buf_get ||
+        !p_dma_buf_put ||
         !p_dma_buf_begin_cpu_access ||
         !p_dma_buf_end_cpu_access ||
-        !p_dma_buf_vmap || !p_dma_buf_vunmap)
+        !p_dma_buf_vmap ||
+        !p_dma_buf_vunmap)
         return -1;
 
     if (hook_wrap2(
@@ -369,7 +404,9 @@ static long cam_kpm_init(
         return -1;
     }
 
-    pr_info("cam-preview: init ok\n");
+    pr_info(
+        "cam-preview: init ok\n");
+
     return 0;
 }
 
@@ -382,14 +419,19 @@ static long cam_kpm_control0(
         return -1;
 
     if (args[0] == 'c') {
+
         release_dmabuf();
+
         armed = 1;
         done_seen = 0;
+
         saved_fd = -1;
         saved_handle = 0;
         saved_request = 0;
 
-        pr_info("cam-preview: armed\n");
+        pr_info(
+            "cam-preview: armed\n");
+
         compat_copy_to_user(
             out_msg,"armed",6);
 
@@ -398,8 +440,10 @@ static long cam_kpm_control0(
         if (!saved_dmabuf || !done_seen) {
             pr_info(
                 "cam-preview: no preview DONE\n");
+
             compat_copy_to_user(
                 out_msg,"no_done",8);
+
             return 0;
         }
 
@@ -415,9 +459,9 @@ static long cam_kpm_control0(
         armed = 0;
 
         pr_info(
-            "cam-preview: stop "
-            "fd=%d dmabuf=%p\n",
-            saved_fd,saved_dmabuf);
+            "cam-preview: stop fd=%d dmabuf=%p\n",
+            saved_fd,
+            saved_dmabuf);
 
         release_dmabuf();
 
@@ -440,7 +484,9 @@ static long cam_kpm_exit(void *reserved)
 
     release_dmabuf();
 
-    pr_info("cam-preview: exit\n");
+    pr_info(
+        "cam-preview: exit\n");
+
     return 0;
 }
 
