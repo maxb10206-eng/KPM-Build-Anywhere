@@ -1,103 +1,94 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <kutils.h>
 #include <kputils.h>
 #include <hook.h>
 
 KPM_NAME("cam-ubwc-config-probe");
-KPM_VERSION("2.0.0");
+KPM_VERSION("2.0.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Probe runtime UBWC v2 config");
+KPM_DESCRIPTION("Probe Camera PREP packet for UBWC config");
 
-struct kp_ubwc_plane {
-    unsigned int port_type,meta_stride,meta_size,meta_offset;
-    unsigned int packer_config,mode_config_0,mode_config_1,tile_config;
-    unsigned int h_init,v_init,static_ctrl,ctrl_2,stats_ctrl_2;
-    unsigned int lossy_threshold_0,lossy_threshold_1,lossy_var_offset;
-    unsigned int bandwidth_limit,reserved[3];
+struct kp_cam_packet_header {
+    unsigned int op_code,size;
+    unsigned long long request_id;
+    unsigned int flags,padding;
 };
 
-struct kp_ubwc_config_v2 {
-    unsigned int api_version,num_ports;
-    struct kp_ubwc_plane ubwc_plane_cfg[8];
+struct kp_cam_packet {
+    struct kp_cam_packet_header header;
+    unsigned int cmd_buf_offset,num_cmd_buf;
+    unsigned int io_configs_offset,num_io_configs;
+    unsigned int patch_offset,num_patches;
+    unsigned int kmd_cmd_buf_index,kmd_cmd_buf_offset;
+    unsigned long long payload[1];
 };
 
-static unsigned long addr_ubwc;
+struct kp_cam_cmd_buf_desc {
+    int mem_handle;
+    unsigned int offset,size,length,type,meta_data;
+};
+
+static unsigned long addr_prepare;
 static volatile int armed;
 
-static void before_ubwc(
-    hook_fargs3_t *args,void *udata)
+static void before_prepare(
+    hook_fargs2_t *args,void *udata)
 {
-    struct kp_ubwc_config_v2 *cfg;
+    struct kp_cam_packet *p;
+    struct kp_cam_cmd_buf_desc *cmd;
     unsigned int i,n;
 
     if (!armed)
         return;
 
-    /*
-     * cam_isp_blob_ubwc_update_v2(
-     *     uint32_t blob_type,
-     *     struct cam_isp_generic_blob_info *blob_info,
-     *     struct cam_ubwc_config_v2 *ubwc_config,
-     *     struct cam_hw_prepare_update_args *prepare)
-     *
-     * hook_fargs3 这里取第三个参数。
-     */
-    cfg = (struct kp_ubwc_config_v2 *)args->arg3;
-    if (!cfg)
+    p = *(struct kp_cam_packet **)args->arg1;
+    if (!p)
         return;
 
-    n = cfg->num_ports;
-    if (n > 8)
-        n = 8;
-
     pr_info(
-        "cam-ubwc: HIT api=%u ports=%u\n",
-        cfg->api_version,n);
+        "cam-ubwc: PREP req=%llu "
+        "op=0x%x size=%u "
+        "cmd_off=%u cmd_num=%u "
+        "io_off=%u io_num=%u "
+        "patch_off=%u patch_num=%u\n",
+        p->header.request_id,
+        p->header.op_code,
+        p->header.size,
+        p->cmd_buf_offset,
+        p->num_cmd_buf,
+        p->io_configs_offset,
+        p->num_io_configs,
+        p->patch_offset,
+        p->num_patches);
+
+    n = p->num_cmd_buf;
+    if (n > 32)
+        n = 32;
+
+    cmd = (struct kp_cam_cmd_buf_desc *)(
+        (unsigned char *)p->payload +
+        p->cmd_buf_offset);
 
     for (i = 0; i < n; i++) {
-        struct kp_ubwc_plane *p =
-            &cfg->ubwc_plane_cfg[i];
-
         pr_info(
-            "cam-ubwc: P[%u] port=0x%x "
-            "meta_stride=%u meta_size=%u meta_off=%u\n",
-            i,p->port_type,
-            p->meta_stride,
-            p->meta_size,
-            p->meta_offset);
-
-        pr_info(
-            "cam-ubwc: P[%u] pack=0x%x "
-            "mode0=0x%x mode1=0x%x tile=0x%x\n",
-            i,p->packer_config,
-            p->mode_config_0,
-            p->mode_config_1,
-            p->tile_config);
-
-        pr_info(
-            "cam-ubwc: P[%u] h=%u v=%u "
-            "static=0x%x ctrl2=0x%x stats2=0x%x\n",
-            i,p->h_init,p->v_init,
-            p->static_ctrl,
-            p->ctrl_2,
-            p->stats_ctrl_2);
-
-        pr_info(
-            "cam-ubwc: P[%u] "
-            "lossy0=0x%x lossy1=0x%x "
-            "var=0x%x bw=0x%x\n",
+            "cam-ubwc: CMD[%u] "
+            "mem=%d off=%u size=%u "
+            "len=%u type=%u meta=%u\n",
             i,
-            p->lossy_threshold_0,
-            p->lossy_threshold_1,
-            p->lossy_var_offset,
-            p->bandwidth_limit);
+            cmd[i].mem_handle,
+            cmd[i].offset,
+            cmd[i].size,
+            cmd[i].length,
+            cmd[i].type,
+            cmd[i].meta_data);
     }
 
     armed = 0;
-    pr_info("cam-ubwc: probe complete\n");
+
+    pr_info(
+        "cam-ubwc: PREP dump complete\n");
 }
 
 static long cam_kpm_init(
@@ -105,27 +96,27 @@ static long cam_kpm_init(
     const char *event,
     void *reserved)
 {
-    addr_ubwc =
+    addr_prepare =
         kallsyms_lookup_name(
-            "cam_isp_blob_ubwc_update_v2");
+            "cam_ife_mgr_prepare_hw_update");
 
     pr_info(
-        "cam-ubwc: ubwc_v2=%lx\n",
-        addr_ubwc);
+        "cam-ubwc: prepare=%lx\n",
+        addr_prepare);
 
-    if (!addr_ubwc) {
-        pr_info(
-            "cam-ubwc: symbol not found\n");
-        return -1;
-    }
-
-    if (hook_wrap3(
-        (void *)addr_ubwc,
-        before_ubwc,
-        NULL,NULL))
+    if (!addr_prepare)
         return -1;
 
-    pr_info("cam-ubwc: init ok\n");
+    if (hook_wrap2(
+        (void *)addr_prepare,
+        before_prepare,
+        NULL,
+        NULL))
+        return -1;
+
+    pr_info(
+        "cam-ubwc: init ok\n");
+
     return 0;
 }
 
@@ -139,28 +130,41 @@ static long cam_kpm_control0(
 
     if (args[0] == 'c') {
         armed = 1;
-        pr_info("cam-ubwc: armed\n");
+
+        pr_info(
+            "cam-ubwc: armed\n");
+
         compat_copy_to_user(
-            out_msg,"armed",6);
+            out_msg,
+            "armed",
+            6);
 
     } else if (args[0] == 's') {
         armed = 0;
-        pr_info("cam-ubwc: stopped\n");
+
+        pr_info(
+            "cam-ubwc: stopped\n");
+
         compat_copy_to_user(
-            out_msg,"stopped",8);
+            out_msg,
+            "stopped",
+            8);
     }
 
     return 0;
 }
 
-static long cam_kpm_exit(void *reserved)
+static long cam_kpm_exit(
+    void *reserved)
 {
     armed = 0;
 
-    if (addr_ubwc)
-        unhook((void *)addr_ubwc);
+    if (addr_prepare)
+        unhook((void *)addr_prepare);
 
-    pr_info("cam-ubwc: exit\n");
+    pr_info(
+        "cam-ubwc: exit\n");
+
     return 0;
 }
 
