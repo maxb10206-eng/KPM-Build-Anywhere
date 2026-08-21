@@ -5,10 +5,10 @@
 #include <hook.h>
 
 KPM_NAME("cam-preview-format-probe");
-KPM_VERSION("1.7.1");
+KPM_VERSION("1.7.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Probe all Camera output formats from prepare");
+KPM_DESCRIPTION("Probe Camera output format from prepare");
 
 #define CAM_BUF_OUTPUT 2
 
@@ -34,6 +34,11 @@ struct kp_cam_plane_cfg {
     unsigned int h_init,v_init;
 };
 
+struct kp_cam_cmd_buf_desc {
+    int mem_handle;
+    unsigned int offset,size,length,type,meta_data;
+};
+
 struct kp_cam_buf_io_cfg {
     int mem_handle[3];
     unsigned int offsets[3];
@@ -41,7 +46,7 @@ struct kp_cam_buf_io_cfg {
     unsigned int format,color_space,color_pattern,bpp,rotation;
     unsigned int resource_type;
     int fence,early_fence;
-    unsigned int aux_cmd_buf[8];
+    struct kp_cam_cmd_buf_desc aux_cmd_buf;
     unsigned int direction,batch_size;
     unsigned int subsample_pattern,subsample_period;
     unsigned int framedrop_pattern,framedrop_period;
@@ -52,36 +57,44 @@ static unsigned long addr_prepare;
 static volatile int armed;
 
 static void before_prepare(
-    hook_fargs2_t *args, void *udata)
+    hook_fargs2_t *args,void *udata)
 {
     struct kp_cam_packet *p;
     struct kp_cam_buf_io_cfg *io;
-    unsigned int i,n;
+    unsigned int i;
 
-    if (!armed) return;
+    if (!armed)
+        return;
 
     p = *(struct kp_cam_packet **)args->arg1;
-    if (!p || !p->num_io_configs || p->num_io_configs > 64)
+    if (!p)
+        return;
+
+    if (!p->num_io_configs ||
+        p->num_io_configs > 64)
         return;
 
     io = (struct kp_cam_buf_io_cfg *)(
-        (unsigned char *)p->payload + p->io_configs_offset);
+        (unsigned char *)p->payload +
+        p->io_configs_offset);
 
     pr_info(
-        "cam-probe: PREP req=%llu num_io=%u\n",
-        p->header.request_id,p->num_io_configs);
-
-    n = 0;
+        "cam-probe: PREP req=%llu "
+        "num_io=%u offset=%u\n",
+        p->header.request_id,
+        p->num_io_configs,
+        p->io_configs_offset);
 
     for (i = 0; i < p->num_io_configs; i++) {
-        if (io[i].direction != CAM_BUF_OUTPUT)
-            continue;
 
         pr_info(
-            "cam-probe: OUT[%u] res=0x%x fmt=%u "
+            "cam-probe: IO[%u] "
+            "dir=%u res=0x%x fmt=%u "
             "w=%u h=%u stride=%u slice=%u "
-            "off=%u mem=0x%x\n",
-            n++,
+            "off=%u mem0=0x%x "
+            "plane_fmt=%u bpp=%u\n",
+            i,
+            io[i].direction,
             io[i].resource_type,
             io[i].format,
             io[i].planes[0].width,
@@ -89,17 +102,15 @@ static void before_prepare(
             io[i].planes[0].plane_stride,
             io[i].planes[0].slice_height,
             io[i].offsets[0],
-            (unsigned int)io[i].mem_handle[0]);
+            (unsigned int)io[i].mem_handle[0],
+            io[i].planes[0].packer_config,
+            io[i].bpp);
     }
 
-    /*
-     * 只观察第一次 PREP，避免预览连续刷屏。
-     */
     armed = 0;
 
     pr_info(
-        "cam-probe: probe complete outputs=%u\n",
-        n);
+        "cam-probe: probe complete\n");
 }
 
 static long cam_kpm_init(
@@ -140,6 +151,7 @@ static long cam_kpm_control0(
         return -1;
 
     if (args[0] == 'c') {
+
         armed = 1;
 
         pr_info(
@@ -151,6 +163,7 @@ static long cam_kpm_control0(
             6);
 
     } else if (args[0] == 's') {
+
         armed = 0;
 
         pr_info(
