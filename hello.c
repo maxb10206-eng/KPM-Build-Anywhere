@@ -6,10 +6,10 @@
 #include <hook.h>
 
 KPM_NAME("cam-preview-ubwc-probe");
-KPM_VERSION("1.8.3");
+KPM_VERSION("1.8.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Probe preview UBWC TP10 layout");
+KPM_DESCRIPTION("Read UBWC TP10 image payload after metadata");
 
 #define CAM_BUF_OUTPUT 2
 #define PREVIEW_RES 0x3000
@@ -91,6 +91,7 @@ static volatile unsigned long long saved_request;
 static volatile unsigned int saved_width,saved_height;
 static volatile unsigned int saved_stride,saved_slice;
 static volatile unsigned int saved_offset,saved_format;
+static volatile unsigned int saved_meta_size,saved_meta_stride;
 
 static void release_dmabuf(void)
 {
@@ -155,44 +156,25 @@ static void before_prepare(hook_fargs2_t *args,void *udata)
         saved_slice = pl->slice_height;
         saved_offset = io[i].offsets[0];
         saved_format = io[i].format;
+        saved_meta_size = pl->meta_size;
+        saved_meta_stride = pl->meta_stride;
 
         pr_info(
             "cam-preview: PREP req=%llu fd=%d dmabuf=%p "
-            "res=0x%x fmt=%u\n",
+            "res=0x%x fmt=%u w=%u h=%u stride=%u slice=%u "
+            "meta_stride=%u meta_size=%u off=%u\n",
             saved_request,
             saved_fd,
             saved_dmabuf,
             io[i].resource_type,
-            saved_format);
-
-        pr_info(
-            "cam-preview: GEOM "
-            "w=%u h=%u stride=%u slice=%u off=%u "
-            "main_bytes=%llu\n",
-            pl->width,
-            pl->height,
-            pl->plane_stride,
-            pl->slice_height,
-            io[i].offsets[0],
-            (unsigned long long)pl->plane_stride *
-            (unsigned long long)pl->slice_height);
-
-        pr_info(
-            "cam-preview: META "
-            "stride=%u size=%u off=%u\n",
-            pl->meta_stride,
-            pl->meta_size,
-            pl->meta_offset);
-
-        pr_info(
-            "cam-preview: CFG "
-            "packer=0x%x mode=0x%x tile=0x%x "
-            "h_init=%u v_init=%u\n",
-            pl->packer_config,
-            pl->mode_config,
-            pl->tile_config,
-            pl->h_init,
-            pl->v_init);
+            saved_format,
+            saved_width,
+            saved_height,
+            saved_stride,
+            saved_slice,
+            saved_meta_stride,
+            saved_meta_size,
+            saved_offset);
 
         return;
     }
@@ -243,25 +225,27 @@ static int read_preview64(void)
 {
     unsigned char *vaddr;
     unsigned char data[TEST_READ_LEN];
-    unsigned long long main_bytes;
+    unsigned long long image_offset;
     int rc,i;
 
     if (!saved_dmabuf || !done_seen)
         return -1;
 
-    main_bytes =
-        (unsigned long long)saved_stride *
-        (unsigned long long)saved_slice;
+    image_offset =
+        (unsigned long long)saved_offset +
+        (unsigned long long)saved_meta_size;
 
     pr_info(
-        "cam-preview: geometry bytes=%llu "
-        "w=%u h=%u stride=%u slice=%u offset=%u\n",
-        main_bytes,
+        "cam-preview: READ image_offset=%llu "
+        "meta_size=%u meta_stride=%u "
+        "w=%u h=%u stride=%u slice=%u\n",
+        image_offset,
+        saved_meta_size,
+        saved_meta_stride,
         saved_width,
         saved_height,
         saved_stride,
-        saved_slice,
-        saved_offset);
+        saved_slice);
 
     rc = p_dma_buf_begin_cpu_access(
         saved_dmabuf,0);
@@ -287,11 +271,11 @@ static int read_preview64(void)
 
     memcpy(
         data,
-        vaddr + saved_offset,
+        vaddr + image_offset,
         TEST_READ_LEN);
 
     pr_info(
-        "cam-preview: DATA 00: "
+        "cam-preview: IMAGE 00: "
         "%02x %02x %02x %02x %02x %02x %02x %02x "
         "%02x %02x %02x %02x %02x %02x %02x %02x\n",
         data[0],data[1],data[2],data[3],
@@ -301,7 +285,7 @@ static int read_preview64(void)
 
     for (i = 16; i < TEST_READ_LEN; i += 16) {
         pr_info(
-            "cam-preview: DATA %02d: "
+            "cam-preview: IMAGE %02d: "
             "%02x %02x %02x %02x %02x %02x %02x %02x "
             "%02x %02x %02x %02x %02x %02x %02x %02x\n",
             i,
@@ -326,7 +310,7 @@ static int read_preview64(void)
 
     if (!rc)
         pr_info(
-            "cam-preview: READ64 OK\n");
+            "cam-preview: IMAGE READ OK\n");
 
     return rc;
 }
@@ -380,10 +364,8 @@ static long cam_kpm_init(
         (unsigned long)p_dma_buf_vmap,
         (unsigned long)p_dma_buf_vunmap);
 
-    if (!addr_prepare ||
-        !addr_buf_done ||
-        !p_dma_buf_get ||
-        !p_dma_buf_put ||
+    if (!addr_prepare || !addr_buf_done ||
+        !p_dma_buf_get || !p_dma_buf_put ||
         !p_dma_buf_begin_cpu_access ||
         !p_dma_buf_end_cpu_access ||
         !p_dma_buf_vmap ||
@@ -421,7 +403,6 @@ static long cam_kpm_control0(
     if (args[0] == 'c') {
 
         release_dmabuf();
-
         armed = 1;
         done_seen = 0;
 
@@ -433,7 +414,9 @@ static long cam_kpm_control0(
             "cam-preview: armed\n");
 
         compat_copy_to_user(
-            out_msg,"armed",6);
+            out_msg,
+            "armed",
+            6);
 
     } else if (args[0] == 'g') {
 
@@ -442,17 +425,23 @@ static long cam_kpm_control0(
                 "cam-preview: no preview DONE\n");
 
             compat_copy_to_user(
-                out_msg,"no_done",8);
+                out_msg,
+                "no_done",
+                8);
 
             return 0;
         }
 
         if (!read_preview64())
             compat_copy_to_user(
-                out_msg,"read_ok",8);
+                out_msg,
+                "read_ok",
+                8);
         else
             compat_copy_to_user(
-                out_msg,"read_fail",10);
+                out_msg,
+                "read_fail",
+                10);
 
     } else if (args[0] == 's') {
 
@@ -466,7 +455,9 @@ static long cam_kpm_control0(
         release_dmabuf();
 
         compat_copy_to_user(
-            out_msg,"stopped",8);
+            out_msg,
+            "stopped",
+            8);
     }
 
     return 0;
