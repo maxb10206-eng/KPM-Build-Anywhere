@@ -2,21 +2,20 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
+#include <linux/dma-buf.h>
 #include <kputils.h>
 #include <hook.h>
 
 KPM_NAME("cam-preview-ubwc-probe");
-KPM_VERSION("1.8.0");
+KPM_VERSION("1.8.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Probe preview UBWC TP10 frame");
+KPM_DESCRIPTION("Probe preview UBWC TP10 dmabuf size");
 
 #define CAM_BUF_OUTPUT 2
 #define PREVIEW_RES 0x3000
 #define PREVIEW_FMT 39
 #define MAX_RES 32
-
-struct dma_buf;
 
 struct kp_cam_packet_header {
     unsigned int op_code,size;
@@ -142,8 +141,8 @@ static void before_prepare(
         dmabuf = p_dma_buf_get(fd);
         if (!dmabuf) {
             pr_info(
-                "cam-preview: dma_buf_get FAILED "
-                "fd=%d\n",fd);
+                "cam-preview: dma_buf_get FAILED fd=%d\n",
+                fd);
             return;
         }
 
@@ -163,16 +162,10 @@ static void before_prepare(
             "req=%llu fd=%d dmabuf=%p "
             "res=0x%x fmt=%u "
             "w=%u h=%u stride=%u slice=%u off=%u\n",
-            saved_request,
-            saved_fd,
-            saved_dmabuf,
-            io[i].resource_type,
-            saved_format,
-            saved_width,
-            saved_height,
-            saved_stride,
-            saved_slice,
-            saved_offset);
+            saved_request,saved_fd,saved_dmabuf,
+            io[i].resource_type,saved_format,
+            saved_width,saved_height,saved_stride,
+            saved_slice,saved_offset);
 
         return;
     }
@@ -210,9 +203,8 @@ static void before_buf_done(
         done_seen = 1;
 
         pr_info(
-            "cam-preview: DONE "
-            "hw=%u req=%llu fd=%d "
-            "last_addr=0x%x\n",
+            "cam-preview: DONE hw=%u req=%llu "
+            "fd=%d last_addr=0x%x\n",
             event_info->hw_idx,
             saved_request,
             saved_fd,
@@ -226,10 +218,22 @@ static int read_preview64(void)
 {
     unsigned char *vaddr;
     unsigned char data[64];
+    size_t dmabuf_size;
     int rc,i;
 
     if (!saved_dmabuf || !done_seen)
         return -1;
+
+    dmabuf_size = saved_dmabuf->size;
+
+    pr_info(
+        "cam-preview: dmabuf size=%zu "
+        "w=%u h=%u stride=%u slice=%u "
+        "offset=%u\n",
+        dmabuf_size,
+        saved_width,saved_height,
+        saved_stride,saved_slice,
+        saved_offset);
 
     rc = p_dma_buf_begin_cpu_access(
         saved_dmabuf,0);
@@ -241,7 +245,8 @@ static int read_preview64(void)
     if (rc)
         return rc;
 
-    vaddr = p_dma_buf_vmap(saved_dmabuf);
+    vaddr = p_dma_buf_vmap(
+        saved_dmabuf);
 
     pr_info(
         "cam-preview: vmap=%lx\n",
@@ -250,6 +255,23 @@ static int read_preview64(void)
     if (!vaddr) {
         p_dma_buf_end_cpu_access(
             saved_dmabuf,0);
+        return -1;
+    }
+
+    if (saved_offset + sizeof(data) > dmabuf_size) {
+
+        pr_info(
+            "cam-preview: READ64 out of range "
+            "size=%zu offset=%u\n",
+            dmabuf_size,
+            saved_offset);
+
+        p_dma_buf_vunmap(
+            saved_dmabuf,vaddr);
+
+        p_dma_buf_end_cpu_access(
+            saved_dmabuf,0);
+
         return -1;
     }
 
@@ -268,6 +290,7 @@ static int read_preview64(void)
         data[12],data[13],data[14],data[15]);
 
     for (i = 16; i < 64; i += 16) {
+
         pr_info(
             "cam-preview: DATA %02d: "
             "%02x %02x %02x %02x %02x %02x %02x %02x "
@@ -337,9 +360,8 @@ static long cam_kpm_init(
             "dma_buf_vunmap");
 
     pr_info(
-        "cam-preview: prepare=%lx "
-        "buf_done=%lx get=%lx "
-        "begin=%lx end=%lx "
+        "cam-preview: prepare=%lx buf_done=%lx "
+        "get=%lx begin=%lx end=%lx "
         "vmap=%lx vunmap=%lx\n",
         addr_prepare,
         addr_buf_done,
@@ -414,8 +436,7 @@ static long cam_kpm_control0(
         if (!saved_dmabuf || !done_seen) {
 
             pr_info(
-                "cam-preview: "
-                "no preview DONE\n");
+                "cam-preview: no preview DONE\n");
 
             compat_copy_to_user(
                 out_msg,
