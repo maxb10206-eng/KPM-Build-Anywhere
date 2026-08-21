@@ -1,138 +1,105 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <linux/string.h>
 #include <kputils.h>
 #include <hook.h>
 
 KPM_NAME("cam-preview-format-probe");
-KPM_VERSION("1.7.0");
+KPM_VERSION("1.7.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Probe IFE output formats at acquire_hw");
+KPM_DESCRIPTION("Probe all Camera output formats from prepare");
 
-#define MAX_RES 64
+#define CAM_BUF_OUTPUT 2
 
-struct kp_cam_isp_out_port {
-    unsigned int res_type;
-    unsigned int format;
-    unsigned int width;
-    unsigned int height;
-    unsigned int comp_grp_id;
-    unsigned int split_point;
-    unsigned int secure_mode;
-    unsigned int reserved;
+struct kp_cam_packet_header {
+    unsigned int op_code,size;
+    unsigned long long request_id;
+    unsigned int flags,padding;
 };
 
-struct kp_cam_isp_in_port {
-    unsigned int res_type;
-    unsigned int lane_type, lane_num, lane_cfg;
-    unsigned int vc, dt, num_valid_vc_dt;
-    unsigned int format;
-    unsigned int test_pattern, usage_type;
-    unsigned int left_start, left_stop, left_width;
-    unsigned int right_start, right_stop, right_width;
-    unsigned int line_start, line_stop, height;
-    unsigned int pixel_clk, batch_size, dsp_mode, hbi_cnt;
-    unsigned int cust_node, horizontal_bin, qcfa_bin;
-    unsigned int num_out_res;
-    struct kp_cam_isp_out_port data[1];
+struct kp_cam_packet {
+    struct kp_cam_packet_header header;
+    unsigned int cmd_buf_offset,num_cmd_buf;
+    unsigned int io_configs_offset,num_io_configs;
+    unsigned int patch_offset,num_patches;
+    unsigned int kmd_cmd_buf_index,kmd_cmd_buf_offset;
+    unsigned long long payload[1];
 };
 
-struct kp_cam_isp_acquire_hw_info {
-    unsigned int input_info_offset;
-    unsigned int input_info_size;
-    unsigned int input_info_version;
-    unsigned int num_inputs;
-    unsigned char data[1];
+struct kp_cam_plane_cfg {
+    unsigned int width,height,plane_stride,slice_height;
+    unsigned int meta_stride,meta_size,meta_offset;
+    unsigned int packer_config,mode_config,tile_config;
+    unsigned int h_init,v_init;
 };
 
-struct kp_cam_hw_acquire_args {
-    unsigned int num_acq;
-    unsigned int reserved0;
-    void *acquire_info;
-    unsigned int acquire_info_size;
-    unsigned int reserved1;
-    void *context_data;
-    void *event_cb;
-    void *mini_dump_cb;
+struct kp_cam_buf_io_cfg {
+    int mem_handle[3];
+    unsigned int offsets[3];
+    struct kp_cam_plane_cfg planes[3];
+    unsigned int format,color_space,color_pattern,bpp,rotation;
+    unsigned int resource_type;
+    int fence,early_fence;
+    unsigned int aux_cmd_buf[8];
+    unsigned int direction,batch_size;
+    unsigned int subsample_pattern,subsample_period;
+    unsigned int framedrop_pattern,framedrop_period;
+    unsigned int flag,padding;
 };
 
-static unsigned long addr_acquire;
-static volatile unsigned int probe_count;
+static unsigned long addr_prepare;
+static volatile int armed;
 
-static void before_acquire(
+static void before_prepare(
     hook_fargs2_t *args, void *udata)
 {
-    struct kp_cam_hw_acquire_args *a;
-    struct kp_cam_isp_acquire_hw_info *info;
-    unsigned char *base, *p;
-    unsigned int i, j, n;
-    struct kp_cam_isp_in_port *in;
-    struct kp_cam_isp_out_port *out;
+    struct kp_cam_packet *p;
+    struct kp_cam_buf_io_cfg *io;
+    unsigned int i,n;
 
-    a = (struct kp_cam_hw_acquire_args *)args->arg1;
-    if (!a || !a->acquire_info || !a->acquire_info_size)
+    if (!armed) return;
+
+    p = *(struct kp_cam_packet **)args->arg1;
+    if (!p || !p->num_io_configs || p->num_io_configs > 64)
         return;
 
-    info =
-        (struct kp_cam_isp_acquire_hw_info *)
-        a->acquire_info;
-
-    if (!info->input_info_size ||
-        !info->input_info_offset ||
-        info->num_inputs > MAX_RES)
-        return;
-
-    base = (unsigned char *)&info->data[0];
-    p = base + info->input_info_offset;
+    io = (struct kp_cam_buf_io_cfg *)(
+        (unsigned char *)p->payload + p->io_configs_offset);
 
     pr_info(
-        "cam-probe: ACQUIRE inputs=%u ver=0x%x size=%u off=%u\n",
-        info->num_inputs,
-        info->input_info_version,
-        a->acquire_info_size,
-        info->input_info_offset);
+        "cam-probe: PREP req=%llu num_io=%u\n",
+        p->header.request_id,p->num_io_configs);
 
-    for (i = 0; i < info->num_inputs; i++) {
-        in = (struct kp_cam_isp_in_port *)p;
-        n = in->num_out_res;
+    n = 0;
 
-        if (!n || n > MAX_RES)
-            return;
+    for (i = 0; i < p->num_io_configs; i++) {
+        if (io[i].direction != CAM_BUF_OUTPUT)
+            continue;
 
         pr_info(
-            "cam-probe: IN[%u] res=%u outs=%u fmt=%u "
-            "w=%u h=%u\n",
-            i,
-            in->res_type,
-            n,
-            in->format,
-            in->left_width,
-            in->height);
-
-        for (j = 0; j < n; j++) {
-            out = &in->data[j];
-
-            pr_info(
-                "cam-probe: OUT[%u][%u] "
-                "res=%u fmt=%u w=%u h=%u grp=%u secure=%u\n",
-                i,
-                j,
-                out->res_type,
-                out->format,
-                out->width,
-                out->height,
-                out->comp_grp_id,
-                out->secure_mode);
-        }
-
-        p += sizeof(struct kp_cam_isp_in_port) +
-             (n - 1) * sizeof(struct kp_cam_isp_out_port);
-
-        if (++probe_count > 256)
-            return;
+            "cam-probe: OUT[%u] res=0x%x fmt=%u "
+            "w=%u h=%u stride=%u slice=%u "
+            "off=%u mem=0x%x\n",
+            n++,
+            io[i].resource_type,
+            io[i].format,
+            io[i].planes[0].width,
+            io[i].planes[0].height,
+            io[i].planes[0].plane_stride,
+            io[i].planes[0].slice_height,
+            io[i].offsets[0],
+            (unsigned int)io[i].mem_handle[0]);
     }
+
+    /*
+     * 只观察第一次 PREP，避免预览连续刷屏。
+     */
+    armed = 0;
+
+    pr_info(
+        "cam-probe: probe complete outputs=%u\n",
+        n);
 }
 
 static long cam_kpm_init(
@@ -140,20 +107,20 @@ static long cam_kpm_init(
     const char *event,
     void *reserved)
 {
-    addr_acquire =
+    addr_prepare =
         kallsyms_lookup_name(
-            "cam_ife_mgr_acquire_hw");
+            "cam_ife_mgr_prepare_hw_update");
 
     pr_info(
-        "cam-probe: acquire=%lx\n",
-        addr_acquire);
+        "cam-probe: prepare=%lx\n",
+        addr_prepare);
 
-    if (!addr_acquire)
+    if (!addr_prepare)
         return -1;
 
     if (hook_wrap2(
-        (void *)addr_acquire,
-        before_acquire,
+        (void *)addr_prepare,
+        before_prepare,
         NULL,
         NULL))
         return -1;
@@ -173,7 +140,7 @@ static long cam_kpm_control0(
         return -1;
 
     if (args[0] == 'c') {
-        probe_count = 0;
+        armed = 1;
 
         pr_info(
             "cam-probe: armed\n");
@@ -184,9 +151,10 @@ static long cam_kpm_control0(
             6);
 
     } else if (args[0] == 's') {
+        armed = 0;
+
         pr_info(
-            "cam-probe: stop count=%u\n",
-            probe_count);
+            "cam-probe: stopped\n");
 
         compat_copy_to_user(
             out_msg,
@@ -197,10 +165,13 @@ static long cam_kpm_control0(
     return 0;
 }
 
-static long cam_kpm_exit(void *reserved)
+static long cam_kpm_exit(
+    void *reserved)
 {
-    if (addr_acquire)
-        unhook((void *)addr_acquire);
+    armed = 0;
+
+    if (addr_prepare)
+        unhook((void *)addr_prepare);
 
     pr_info(
         "cam-probe: exit\n");
