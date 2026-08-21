@@ -2,20 +2,22 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/dma-buf.h>
 #include <kputils.h>
 #include <hook.h>
 
 KPM_NAME("cam-preview-ubwc-probe");
-KPM_VERSION("1.8.1");
+KPM_VERSION("1.8.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Probe preview UBWC TP10 dmabuf size");
+KPM_DESCRIPTION("Probe preview UBWC TP10 buffer");
 
 #define CAM_BUF_OUTPUT 2
 #define PREVIEW_RES 0x3000
 #define PREVIEW_FMT 39
 #define MAX_RES 32
+#define TEST_READ_LEN 64
+
+struct dma_buf;
 
 struct kp_cam_packet_header {
     unsigned int op_code,size;
@@ -80,7 +82,6 @@ static void *(*p_dma_buf_vmap)(struct dma_buf *);
 static void (*p_dma_buf_vunmap)(struct dma_buf *,void *);
 
 static unsigned long addr_prepare,addr_buf_done;
-
 static volatile int armed,done_seen;
 static struct dma_buf *saved_dmabuf;
 
@@ -102,8 +103,7 @@ static void release_dmabuf(void)
     saved_request = 0;
 }
 
-static void before_prepare(
-    hook_fargs2_t *args,void *udata)
+static void before_prepare(hook_fargs2_t *args,void *udata)
 {
     struct kp_cam_packet *p;
     struct kp_cam_buf_io_cfg *io;
@@ -122,16 +122,12 @@ static void before_prepare(
         (unsigned char *)p->payload + p->io_configs_offset);
 
     for (i = 0; i < p->num_io_configs; i++) {
-
         if (io[i].direction != CAM_BUF_OUTPUT)
             continue;
-
         if (io[i].resource_type != PREVIEW_RES)
             continue;
-
         if (io[i].format != PREVIEW_FMT)
             continue;
-
         if (!io[i].mem_handle[0])
             continue;
 
@@ -158,21 +154,23 @@ static void before_prepare(
         saved_format = io[i].format;
 
         pr_info(
-            "cam-preview: PREP saved "
-            "req=%llu fd=%d dmabuf=%p "
-            "res=0x%x fmt=%u "
-            "w=%u h=%u stride=%u slice=%u off=%u\n",
+            "cam-preview: PREP saved req=%llu "
+            "fd=%d dmabuf=%p res=0x%x fmt=%u "
+            "w=%u h=%u stride=%u slice=%u off=%u "
+            "main_bytes=%llu\n",
             saved_request,saved_fd,saved_dmabuf,
             io[i].resource_type,saved_format,
-            saved_width,saved_height,saved_stride,
-            saved_slice,saved_offset);
+            saved_width,saved_height,
+            saved_stride,saved_slice,
+            saved_offset,
+            (unsigned long long)saved_stride *
+            (unsigned long long)saved_slice);
 
         return;
     }
 }
 
-static void before_buf_done(
-    hook_fargs2_t *args,void *udata)
+static void before_buf_done(hook_fargs2_t *args,void *udata)
 {
     struct kp_cam_isp_hw_event_info *event_info;
     struct kp_cam_isp_hw_compdone_event_info *compdone;
@@ -196,7 +194,6 @@ static void before_buf_done(
         n = MAX_RES;
 
     for (i = 0; i < n; i++) {
-
         if (compdone->res_id[i] != PREVIEW_RES)
             continue;
 
@@ -209,7 +206,6 @@ static void before_buf_done(
             saved_request,
             saved_fd,
             compdone->last_consumed_addr[i]);
-
         return;
     }
 }
@@ -217,22 +213,26 @@ static void before_buf_done(
 static int read_preview64(void)
 {
     unsigned char *vaddr;
-    unsigned char data[64];
-    size_t dmabuf_size;
+    unsigned char data[TEST_READ_LEN];
+    unsigned long long main_bytes;
     int rc,i;
 
     if (!saved_dmabuf || !done_seen)
         return -1;
 
-    dmabuf_size = saved_dmabuf->size;
+    main_bytes =
+        (unsigned long long)saved_stride *
+        (unsigned long long)saved_slice;
 
     pr_info(
-        "cam-preview: dmabuf size=%zu "
+        "cam-preview: geometry bytes=%llu "
         "w=%u h=%u stride=%u slice=%u "
         "offset=%u\n",
-        dmabuf_size,
-        saved_width,saved_height,
-        saved_stride,saved_slice,
+        main_bytes,
+        saved_width,
+        saved_height,
+        saved_stride,
+        saved_slice,
         saved_offset);
 
     rc = p_dma_buf_begin_cpu_access(
@@ -245,8 +245,7 @@ static int read_preview64(void)
     if (rc)
         return rc;
 
-    vaddr = p_dma_buf_vmap(
-        saved_dmabuf);
+    vaddr = p_dma_buf_vmap(saved_dmabuf);
 
     pr_info(
         "cam-preview: vmap=%lx\n",
@@ -258,27 +257,10 @@ static int read_preview64(void)
         return -1;
     }
 
-    if (saved_offset + sizeof(data) > dmabuf_size) {
-
-        pr_info(
-            "cam-preview: READ64 out of range "
-            "size=%zu offset=%u\n",
-            dmabuf_size,
-            saved_offset);
-
-        p_dma_buf_vunmap(
-            saved_dmabuf,vaddr);
-
-        p_dma_buf_end_cpu_access(
-            saved_dmabuf,0);
-
-        return -1;
-    }
-
     memcpy(
         data,
         vaddr + saved_offset,
-        sizeof(data));
+        TEST_READ_LEN);
 
     pr_info(
         "cam-preview: DATA 00: "
@@ -289,8 +271,7 @@ static int read_preview64(void)
         data[8],data[9],data[10],data[11],
         data[12],data[13],data[14],data[15]);
 
-    for (i = 16; i < 64; i += 16) {
-
+    for (i = 16; i < TEST_READ_LEN; i += 16) {
         pr_info(
             "cam-preview: DATA %02d: "
             "%02x %02x %02x %02x %02x %02x %02x %02x "
@@ -302,11 +283,8 @@ static int read_preview64(void)
             data[i+12],data[i+13],data[i+14],data[i+15]);
     }
 
-    p_dma_buf_vunmap(
-        saved_dmabuf,vaddr);
-
-    pr_info(
-        "cam-preview: vunmap ok\n");
+    p_dma_buf_vunmap(saved_dmabuf,vaddr);
+    pr_info("cam-preview: vunmap ok\n");
 
     rc = p_dma_buf_end_cpu_access(
         saved_dmabuf,0);
@@ -363,44 +341,35 @@ static long cam_kpm_init(
         "cam-preview: prepare=%lx buf_done=%lx "
         "get=%lx begin=%lx end=%lx "
         "vmap=%lx vunmap=%lx\n",
-        addr_prepare,
-        addr_buf_done,
+        addr_prepare,addr_buf_done,
         (unsigned long)p_dma_buf_get,
         (unsigned long)p_dma_buf_begin_cpu_access,
         (unsigned long)p_dma_buf_end_cpu_access,
         (unsigned long)p_dma_buf_vmap,
         (unsigned long)p_dma_buf_vunmap);
 
-    if (!addr_prepare ||
-        !addr_buf_done ||
-        !p_dma_buf_get ||
-        !p_dma_buf_put ||
+    if (!addr_prepare || !addr_buf_done ||
+        !p_dma_buf_get || !p_dma_buf_put ||
         !p_dma_buf_begin_cpu_access ||
         !p_dma_buf_end_cpu_access ||
-        !p_dma_buf_vmap ||
-        !p_dma_buf_vunmap)
+        !p_dma_buf_vmap || !p_dma_buf_vunmap)
         return -1;
 
     if (hook_wrap2(
         (void *)addr_prepare,
         before_prepare,
-        NULL,
-        NULL))
+        NULL,NULL))
         return -1;
 
     if (hook_wrap2(
         (void *)addr_buf_done,
         before_buf_done,
-        NULL,
-        NULL)) {
-
+        NULL,NULL)) {
         unhook((void *)addr_prepare);
         return -1;
     }
 
-    pr_info(
-        "cam-preview: init ok\n");
-
+    pr_info("cam-preview: init ok\n");
     return 0;
 }
 
@@ -413,49 +382,33 @@ static long cam_kpm_control0(
         return -1;
 
     if (args[0] == 'c') {
-
         release_dmabuf();
-
         armed = 1;
         done_seen = 0;
-
         saved_fd = -1;
         saved_handle = 0;
         saved_request = 0;
 
-        pr_info(
-            "cam-preview: armed\n");
-
+        pr_info("cam-preview: armed\n");
         compat_copy_to_user(
-            out_msg,
-            "armed",
-            6);
+            out_msg,"armed",6);
 
     } else if (args[0] == 'g') {
 
         if (!saved_dmabuf || !done_seen) {
-
             pr_info(
                 "cam-preview: no preview DONE\n");
-
             compat_copy_to_user(
-                out_msg,
-                "no_done",
-                8);
-
+                out_msg,"no_done",8);
             return 0;
         }
 
         if (!read_preview64())
             compat_copy_to_user(
-                out_msg,
-                "read_ok",
-                8);
+                out_msg,"read_ok",8);
         else
             compat_copy_to_user(
-                out_msg,
-                "read_fail",
-                10);
+                out_msg,"read_fail",10);
 
     } else if (args[0] == 's') {
 
@@ -464,15 +417,12 @@ static long cam_kpm_control0(
         pr_info(
             "cam-preview: stop "
             "fd=%d dmabuf=%p\n",
-            saved_fd,
-            saved_dmabuf);
+            saved_fd,saved_dmabuf);
 
         release_dmabuf();
 
         compat_copy_to_user(
-            out_msg,
-            "stopped",
-            8);
+            out_msg,"stopped",8);
     }
 
     return 0;
@@ -490,9 +440,7 @@ static long cam_kpm_exit(void *reserved)
 
     release_dmabuf();
 
-    pr_info(
-        "cam-preview: exit\n");
-
+    pr_info("cam-preview: exit\n");
     return 0;
 }
 
