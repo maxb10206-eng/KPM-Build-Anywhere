@@ -1,14 +1,6 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/vmalloc.h>
-#include <linux/fs.h>
-#include <linux/mutex.h>
-#include <linux/string.h>
-#include <linux/minmax.h>
-#include <linux/types.h>
 #include <kputils.h>
 #include <hook.h>
 
@@ -16,44 +8,60 @@ KPM_NAME("cam-ubwc-frame-injector");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
-KPM_DESCRIPTION("Inject sequential TP10 frames into CAM_BUF_INPUT before VFE Read");
-
-#define CAM_BUF_INPUT        1
-#define CAM_FORMAT_TP10      33
-
-#define MAX_IO_CFG           32
-#define MAX_PLANES           2
-#define MAX_FILE_SIZE        (128UL * 1024UL * 1024UL)
-
-#define INJECT_DISABLED      0
-#define INJECT_ONCE          1
-#define INJECT_LOOP          2
+KPM_DESCRIPTION("Inject deterministic TP10 test frames into CAM_BUF_INPUT");
 
 /*
- * These match the camera-kernel UAPI definitions
- * we inspected earlier.
+ * From the camera-kernel UAPI we inspected.
  */
+#define CAM_BUF_INPUT       1
+#define CAM_FORMAT_TP10     33
 
+#define MAX_IO_CFG           32
+#define MAX_PLANE             2
+
+#define INJECT_OFF            0
+#define INJECT_ONCE           1
+#define INJECT_LOOP           2
+
+#define PATTERN_FLAT_BLACK    0
+#define PATTERN_FLAT_WHITE    1
+#define PATTERN_HORIZONTAL    2
+#define PATTERN_VERTICAL      3
+#define PATTERN_MOVING_BAR    4
+
+
+/*
+ * cam_plane_cfg
+ *
+ * camera-kernel/include/uapi/camera/media/cam_defs.h
+ */
 struct kp_cam_plane_cfg {
     unsigned int width;
     unsigned int height;
     unsigned int plane_stride;
     unsigned int slice_height;
+
     unsigned int meta_stride;
     unsigned int meta_size;
     unsigned int meta_offset;
+
     unsigned int packer_config;
     unsigned int mode_config;
     unsigned int tile_config;
+
     unsigned int h_init;
     unsigned int v_init;
 };
 
-struct kp_cam_buf_io_cfg {
-    int mem_handle[MAX_PLANES];
-    unsigned int offsets[MAX_PLANES];
 
-    struct kp_cam_plane_cfg planes[MAX_PLANES];
+/*
+ * cam_buf_io_cfg
+ */
+struct kp_cam_buf_io_cfg {
+    int mem_handle[MAX_PLANE];
+    unsigned int offsets[MAX_PLANE];
+
+    struct kp_cam_plane_cfg planes[MAX_PLANE];
 
     unsigned int format;
     unsigned int color_space;
@@ -65,7 +73,12 @@ struct kp_cam_buf_io_cfg {
     int fence;
     int early_fence;
 
-    unsigned long long aux_cmd_buf[8];
+    /*
+     * We do not access aux_cmd_buf.
+     * Reserve enough space so following fields remain
+     * at approximately the same ABI position.
+     */
+    unsigned int aux_cmd_buf[8];
 
     unsigned int direction;
     unsigned int batch_size;
@@ -77,22 +90,17 @@ struct kp_cam_buf_io_cfg {
     unsigned int padding;
 };
 
+
 struct kp_cam_packet_header {
     unsigned int op_code;
     unsigned int size;
+
     unsigned long long request_id;
+
     unsigned int flags;
     unsigned int padding;
 };
 
-struct kp_cam_cmd_buf_desc {
-    int mem_handle;
-    unsigned int offset;
-    unsigned int size;
-    unsigned int length;
-    unsigned int type;
-    unsigned int meta_data;
-};
 
 struct kp_cam_packet {
     struct kp_cam_packet_header header;
@@ -112,204 +120,349 @@ struct kp_cam_packet {
     unsigned long long payload[1];
 };
 
+
 /*
- * Minimal layout of cam_mem_cache_ops_cmd.
+ * cam_mem_cache_ops_cmd
  *
- * cam_mem_mgr.c accesses:
- *   cmd->buf_handle
- *   cmd->mem_cache_ops
+ * Only the fields used by cam_mem_mgr_cache_ops() matter here.
  *
- * Keep these fields first.
+ * The exact cache-op numeric values are not needed from the
+ * headers for the compile-safe first version because we use
+ * CLEAN_CACHE = 0 as defined by the camera memory manager
+ * implementation we inspected.
  */
 struct kp_cam_mem_cache_ops_cmd {
     int buf_handle;
     unsigned int mem_cache_ops;
 };
 
+
 /*
- * Values used by cam_mem_mgr.c.
- *
- * If your local cam_req_mgr.h exposes these symbols directly,
- * they can be used instead.
+ * Function pointers resolved at runtime.
  */
-#define KP_CAM_MEM_CLEAN_CACHE      0
-#define KP_CAM_MEM_INV_CACHE        1
-#define KP_CAM_MEM_CLEAN_INV_CACHE  2
-
-
 static unsigned long addr_prepare;
 
 static int (*p_cam_mem_get_cpu_buf)(
-        int buf_handle,
-        unsigned long *vaddr_ptr,
-        unsigned long *len);
+        int,
+        unsigned long *,
+        unsigned long *);
 
 static int (*p_cam_mem_mgr_cache_ops)(
-        struct kp_cam_mem_cache_ops_cmd *cmd);
+        struct kp_cam_mem_cache_ops_cmd *);
 
 
-static DEFINE_MUTEX(inject_lock);
+/*
+ * Runtime state.
+ *
+ * No mutex / vmalloc / fs APIs are used.
+ */
+static volatile int inject_mode = INJECT_OFF;
 
-static unsigned char *inject_data;
-static unsigned long inject_size;
+static volatile unsigned int pattern_mode = PATTERN_MOVING_BAR;
 
-static unsigned long frame_index;
+static volatile unsigned long frame_counter;
 
-static int inject_mode = INJECT_DISABLED;
+static volatile unsigned long injection_counter;
 
-static unsigned int last_width;
-static unsigned int last_height;
-static unsigned int last_stride[MAX_PLANES];
-static unsigned int last_slice_height[MAX_PLANES];
-static unsigned int last_plane_bytes[MAX_PLANES];
-static unsigned int last_plane_count;
+static volatile unsigned int last_width;
+static volatile unsigned int last_height;
 
-static int inject_count;
+static volatile unsigned int last_stride_y;
+static volatile unsigned int last_stride_uv;
+
+static volatile unsigned int last_slice_y;
+static volatile unsigned int last_slice_uv;
 
 
-static int file_read_all(
-        const char *path,
-        unsigned char **out_buf,
-        unsigned long *out_size)
+/*
+ * TP10 packing:
+ *
+ * 3 pixels -> 4 bytes
+ *
+ * Byte layout:
+ *
+ *  b0 = p0[9:2]
+ *  b1 = p1[9:2]
+ *  b2 = p2[9:2]
+ *  b3 = p0[1:0] | p1[1:0]<<2 | p2[1:0]<<4
+ *
+ * This matches the byte-rate rule used by the driver's
+ * BUS_RD_VER1 TP10 unpacker:
+ *
+ * ALIGNUP(pixels, 3) * 4 / 3
+ */
+static void tp10_pack_3(
+        unsigned char *dst,
+        unsigned int p0,
+        unsigned int p1,
+        unsigned int p2)
 {
-    struct file *file;
-    loff_t pos = 0;
-    ssize_t n;
-    unsigned char *buf;
-    unsigned long size;
-    unsigned long done = 0;
+    dst[0] = (unsigned char)((p0 >> 2) & 0xFF);
+    dst[1] = (unsigned char)((p1 >> 2) & 0xFF);
+    dst[2] = (unsigned char)((p2 >> 2) & 0xFF);
 
-    if (!path || !out_buf || !out_size)
-        return -EINVAL;
-
-    file = filp_open(path, O_RDONLY, 0);
-
-    if (IS_ERR(file)) {
-        pr_info(
-            "cam-ubwc-injector: filp_open failed path=%s rc=%ld\n",
-            path,
-            PTR_ERR(file));
-        return PTR_ERR(file);
-    }
-
-    size = i_size_read(file_inode(file));
-
-    if (!size || size > MAX_FILE_SIZE) {
-        pr_info(
-            "cam-ubwc-injector: invalid file size=%lu\n",
-            size);
-
-        filp_close(file, NULL);
-        return -EINVAL;
-    }
-
-    buf = vmalloc(size);
-
-    if (!buf) {
-        filp_close(file, NULL);
-        return -ENOMEM;
-    }
-
-    while (done < size) {
-        unsigned long remain = size - done;
-        unsigned long chunk = min(remain, 1024UL * 1024UL);
-
-        n = kernel_read(
-            file,
-            buf + done,
-            chunk,
-            &pos);
-
-        if (n <= 0) {
-            pr_info(
-                "cam-ubwc-injector: kernel_read failed "
-                "done=%lu size=%lu rc=%zd\n",
-                done,
-                size,
-                n);
-
-            vfree(buf);
-            filp_close(file, NULL);
-            return -EIO;
-        }
-
-        done += n;
-    }
-
-    filp_close(file, NULL);
-
-    *out_buf = buf;
-    *out_size = size;
-
-    return 0;
+    dst[3] =
+        (unsigned char)(
+            (p0 & 0x3) |
+            ((p1 & 0x3) << 2) |
+            ((p2 & 0x3) << 4));
 }
 
 
-static int clean_buffer_cache(int handle)
+/*
+ * Generate one TP10 Y plane.
+ *
+ * The pattern is deterministic and changes with frame_counter.
+ *
+ * 0: black
+ * 1: white
+ * 2: horizontal gradient
+ * 3: vertical gradient
+ * 4: moving vertical bar
+ */
+static void generate_tp10_y(
+        unsigned char *dst,
+        unsigned int width,
+        unsigned int height,
+        unsigned int stride,
+        unsigned int pattern,
+        unsigned long frame)
+{
+    unsigned int y;
+    unsigned int x;
+
+    if (!dst || !width || !height || !stride)
+        return;
+
+    for (y = 0; y < height; y++) {
+
+        unsigned char *row =
+            dst + ((unsigned long)y * stride);
+
+        for (x = 0; x < width; x += 3) {
+
+            unsigned int x0 = x;
+            unsigned int x1 = x + 1;
+            unsigned int x2 = x + 2;
+
+            unsigned int p0;
+            unsigned int p1;
+            unsigned int p2;
+
+            if (x1 >= width)
+                x1 = width - 1;
+
+            if (x2 >= width)
+                x2 = width - 1;
+
+            switch (pattern) {
+
+            case PATTERN_FLAT_BLACK:
+                p0 = 64;
+                p1 = 64;
+                p2 = 64;
+                break;
+
+            case PATTERN_FLAT_WHITE:
+                p0 = 940;
+                p1 = 940;
+                p2 = 940;
+                break;
+
+            case PATTERN_HORIZONTAL:
+                p0 = 64 + (x0 * 876) / (width - 1);
+                p1 = 64 + (x1 * 876) / (width - 1);
+                p2 = 64 + (x2 * 876) / (width - 1);
+                break;
+
+            case PATTERN_VERTICAL:
+                p0 = 64 + (y * 876) / (height - 1);
+                p1 = p0;
+                p2 = p0;
+                break;
+
+            case PATTERN_MOVING_BAR: {
+                unsigned int period = width * 2;
+                unsigned int center;
+
+                if (!period)
+                    period = 1;
+
+                center =
+                    (unsigned int)(
+                        (frame * 32) %
+                        period);
+
+                if (center >= width)
+                    center =
+                        period - center - 1;
+
+                if (x0 >= center &&
+                    x0 < center + width / 8)
+                    p0 = 940;
+                else
+                    p0 = 64;
+
+                if (x1 >= center &&
+                    x1 < center + width / 8)
+                    p1 = 940;
+                else
+                    p1 = 64;
+
+                if (x2 >= center &&
+                    x2 < center + width / 8)
+                    p2 = 940;
+                else
+                    p2 = 64;
+
+                break;
+            }
+
+            default:
+                p0 = 64;
+                p1 = 64;
+                p2 = 64;
+                break;
+            }
+
+            tp10_pack_3(
+                row + ((x / 3) * 4),
+                p0,
+                p1,
+                p2);
+        }
+    }
+}
+
+
+/*
+ * Generate TP10 UV plane.
+ *
+ * We keep U/V constant so that the experiment mainly changes
+ * luma. This makes UBWC differential analysis much cleaner.
+ *
+ * For YUV420:
+ *
+ * UV height = Y height / 2
+ *
+ * UV is treated as interleaved 10-bit U/V data.
+ */
+static void generate_tp10_uv(
+        unsigned char *dst,
+        unsigned int width,
+        unsigned int height,
+        unsigned int stride)
+{
+    unsigned int y;
+    unsigned int x;
+
+    unsigned int uv_height = height / 2;
+
+    if (!dst || !width || !uv_height || !stride)
+        return;
+
+    for (y = 0; y < uv_height; y++) {
+
+        unsigned char *row =
+            dst + ((unsigned long)y * stride);
+
+        /*
+         * Two 10-bit chroma samples are packed as:
+         *
+         * U, V, U, V, ...
+         *
+         * Each three 16-bit logical samples become a 4-byte
+         * TP10 group in the same way as the Y plane.
+         *
+         * We keep chroma around neutral.
+         */
+        for (x = 0; x < width; x += 3) {
+
+            unsigned int u0 = 512;
+            unsigned int v0 = 512;
+            unsigned int u1 = 512;
+            unsigned int v1 = 512;
+            unsigned int u2 = 512;
+            unsigned int v2 = 512;
+
+            unsigned int logical0;
+            unsigned int logical1;
+            unsigned int logical2;
+
+            /*
+             * For the initial injector we keep the chroma
+             * samples neutral. The exact interleaving seen
+             * by the hardware is still determined by the
+             * plane's format configuration.
+             */
+            if ((x & 1) == 0) {
+                logical0 = u0;
+                logical1 = v0;
+                logical2 = u1;
+            } else {
+                logical0 = v1;
+                logical1 = u2;
+                logical2 = v2;
+            }
+
+            tp10_pack_3(
+                row + ((x / 3) * 4),
+                logical0,
+                logical1,
+                logical2);
+        }
+    }
+}
+
+
+/*
+ * Cache clean before VFE reads the buffer.
+ */
+static int clean_cache(
+        int mem_handle)
 {
     struct kp_cam_mem_cache_ops_cmd cmd;
+    int rc;
 
     if (!p_cam_mem_mgr_cache_ops)
         return 0;
 
-    memset(&cmd, 0, sizeof(cmd));
+    cmd.buf_handle = mem_handle;
+    cmd.mem_cache_ops = 0;
 
-    cmd.buf_handle = handle;
-    cmd.mem_cache_ops = KP_CAM_MEM_CLEAN_CACHE;
+    rc =
+        p_cam_mem_mgr_cache_ops(&cmd);
 
-    return p_cam_mem_mgr_cache_ops(&cmd);
+    return rc;
 }
 
 
-static unsigned long calc_frame_size(
-        struct kp_cam_buf_io_cfg *cfg,
-        unsigned int *plane_count)
-{
-    unsigned int i;
-    unsigned long total = 0;
-
-    if (!cfg || !plane_count)
-        return 0;
-
-    *plane_count = 0;
-
-    for (i = 0; i < MAX_PLANES; i++) {
-
-        unsigned long bytes;
-
-        if (!cfg->mem_handle[i])
-            break;
-
-        if (!cfg->planes[i].plane_stride ||
-            !cfg->planes[i].slice_height)
-            return 0;
-
-        bytes =
-            (unsigned long)cfg->planes[i].plane_stride *
-            (unsigned long)cfg->planes[i].slice_height;
-
-        total += bytes;
-
-        *plane_count = i + 1;
-    }
-
-    return total;
-}
-
-
-static int inject_one_cfg(
+/*
+ * Inject exactly one CAM_BUF_INPUT io configuration.
+ */
+static int inject_io_cfg(
         struct kp_cam_buf_io_cfg *cfg,
         unsigned long long request_id)
 {
-    unsigned int i;
-    unsigned int plane_count;
-    unsigned long frame_size;
-    unsigned long frame_off;
+    unsigned long cpu_addr_y;
+    unsigned long cpu_len_y;
+
+    unsigned long cpu_addr_uv;
+    unsigned long cpu_len_uv;
+
+    unsigned int y_bytes;
+    unsigned int uv_bytes;
 
     unsigned int width;
     unsigned int height;
 
-    int injected = 0;
+    unsigned int stride_y;
+    unsigned int stride_uv;
+
+    unsigned int slice_y;
+    unsigned int slice_uv;
+
+    int rc;
 
     if (!cfg)
         return 0;
@@ -320,184 +473,242 @@ static int inject_one_cfg(
     if (cfg->format != CAM_FORMAT_TP10)
         return 0;
 
-    width = cfg->planes[0].width;
-    height = cfg->planes[0].height;
+    if (!cfg->mem_handle[0])
+        return 0;
+
+    width =
+        cfg->planes[0].width;
+
+    height =
+        cfg->planes[0].height;
+
+    stride_y =
+        cfg->planes[0].plane_stride;
+
+    slice_y =
+        cfg->planes[0].slice_height;
+
+    if (!width ||
+        !height ||
+        !stride_y ||
+        !slice_y)
+        return 0;
 
     /*
-     * We deliberately only inject TP10 here.
-     * The actual dimensions are taken from the current request.
+     * Current experiment assumes 2-plane TP10:
+     *
+     *   plane 0 = Y
+     *   plane 1 = UV
      */
-    frame_size = calc_frame_size(
-        cfg,
-        &plane_count);
+    if (!cfg->mem_handle[1]) {
+        pr_info(
+            "cam-ubwc-injector: "
+            "REQ=%llu TP10 input has no UV plane\n",
+            request_id);
+        return 0;
+    }
 
-    if (!frame_size || !plane_count)
+    stride_uv =
+        cfg->planes[1].plane_stride;
+
+    slice_uv =
+        cfg->planes[1].slice_height;
+
+    if (!stride_uv || !slice_uv)
         return 0;
 
-    mutex_lock(&inject_lock);
+    y_bytes =
+        stride_y * slice_y;
 
-    if (!inject_data || !inject_size) {
-        mutex_unlock(&inject_lock);
+    uv_bytes =
+        stride_uv * slice_uv;
+
+    cpu_addr_y = 0;
+    cpu_len_y = 0;
+
+    cpu_addr_uv = 0;
+    cpu_len_uv = 0;
+
+    rc =
+        p_cam_mem_get_cpu_buf(
+            cfg->mem_handle[0],
+            &cpu_addr_y,
+            &cpu_len_y);
+
+    if (rc ||
+        !cpu_addr_y ||
+        !cpu_len_y) {
+
+        pr_info(
+            "cam-ubwc-injector: "
+            "REQ=%llu get Y CPU buf failed "
+            "handle=%d rc=%d len=%lu\n",
+            request_id,
+            cfg->mem_handle[0],
+            rc,
+            cpu_len_y);
+
+        return 0;
+    }
+
+    rc =
+        p_cam_mem_get_cpu_buf(
+            cfg->mem_handle[1],
+            &cpu_addr_uv,
+            &cpu_len_uv);
+
+    if (rc ||
+        !cpu_addr_uv ||
+        !cpu_len_uv) {
+
+        pr_info(
+            "cam-ubwc-injector: "
+            "REQ=%llu get UV CPU buf failed "
+            "handle=%d rc=%d len=%lu\n",
+            request_id,
+            cfg->mem_handle[1],
+            rc,
+            cpu_len_uv);
+
+        return 0;
+    }
+
+    if (y_bytes > cpu_len_y) {
+
+        pr_info(
+            "cam-ubwc-injector: "
+            "REQ=%llu Y buffer too small "
+            "need=%u have=%lu\n",
+            request_id,
+            y_bytes,
+            cpu_len_y);
+
+        return 0;
+    }
+
+    if (uv_bytes > cpu_len_uv) {
+
+        pr_info(
+            "cam-ubwc-injector: "
+            "REQ=%llu UV buffer too small "
+            "need=%u have=%lu\n",
+            request_id,
+            uv_bytes,
+            cpu_len_uv);
+
         return 0;
     }
 
     /*
-     * The uploaded file contains:
+     * Generate directly in the actual Camera input buffers.
      *
-     *   frame0 plane0
-     *   frame0 plane1
-     *   frame1 plane0
-     *   frame1 plane1
-     *   ...
-     *
-     * No header.
+     * No extra large kernel buffer is required.
      */
-    if (inject_size < frame_size) {
-        pr_info(
-            "cam-ubwc-injector: file too small "
-            "req=%llu file=%lu frame=%lu\n",
-            request_id,
-            inject_size,
-            frame_size);
+    generate_tp10_y(
+        (unsigned char *)cpu_addr_y,
+        width,
+        height,
+        stride_y,
+        pattern_mode,
+        frame_counter);
 
-        mutex_unlock(&inject_lock);
+    generate_tp10_uv(
+        (unsigned char *)cpu_addr_uv,
+        width,
+        height,
+        stride_uv);
+
+    /*
+     * Give the DMA device the CPU-written data.
+     */
+    rc =
+        clean_cache(
+            cfg->mem_handle[0]);
+
+    if (rc) {
+
+        pr_info(
+            "cam-ubwc-injector: "
+            "REQ=%llu Y cache clean failed rc=%d\n",
+            request_id,
+            rc);
+
         return 0;
     }
 
-    if (inject_size % frame_size != 0) {
+    rc =
+        clean_cache(
+            cfg->mem_handle[1]);
+
+    if (rc) {
+
         pr_info(
-            "cam-ubwc-injector: file size mismatch "
-            "req=%llu file=%lu frame=%lu remainder=%lu\n",
+            "cam-ubwc-injector: "
+            "REQ=%llu UV cache clean failed rc=%d\n",
             request_id,
-            inject_size,
-            frame_size,
-            inject_size % frame_size);
+            rc);
 
-        mutex_unlock(&inject_lock);
         return 0;
-    }
-
-    frame_off =
-        (frame_index % (inject_size / frame_size)) *
-        frame_size;
-
-    for (i = 0; i < plane_count; i++) {
-
-        unsigned long cpu_addr = 0;
-        unsigned long buf_len = 0;
-        unsigned long plane_bytes;
-        unsigned long dst_off;
-
-        int rc;
-
-        plane_bytes =
-            (unsigned long)cfg->planes[i].plane_stride *
-            (unsigned long)cfg->planes[i].slice_height;
-
-        dst_off = cfg->offsets[i];
-
-        rc = p_cam_mem_get_cpu_buf(
-            cfg->mem_handle[i],
-            &cpu_addr,
-            &buf_len);
-
-        if (rc || !cpu_addr || !buf_len) {
-            pr_info(
-                "cam-ubwc-injector: "
-                "get_cpu_buf failed "
-                "req=%llu plane=%u handle=%d rc=%d len=%lu\n",
-                request_id,
-                i,
-                cfg->mem_handle[i],
-                rc,
-                buf_len);
-
-            mutex_unlock(&inject_lock);
-            return 0;
-        }
-
-        if (dst_off >= buf_len ||
-            plane_bytes > buf_len - dst_off) {
-
-            pr_info(
-                "cam-ubwc-injector: "
-                "buffer too small "
-                "req=%llu plane=%u "
-                "off=%lu plane=%lu buf=%lu\n",
-                request_id,
-                i,
-                dst_off,
-                plane_bytes,
-                buf_len);
-
-            mutex_unlock(&inject_lock);
-            return 0;
-        }
-
-        memcpy(
-            (void *)(cpu_addr + dst_off),
-            inject_data + frame_off,
-            plane_bytes);
-
-        rc = clean_buffer_cache(
-            cfg->mem_handle[i]);
-
-        if (rc) {
-            pr_info(
-                "cam-ubwc-injector: "
-                "cache clean failed "
-                "req=%llu plane=%u rc=%d\n",
-                request_id,
-                i,
-                rc);
-
-            mutex_unlock(&inject_lock);
-            return 0;
-        }
-
-        frame_off += plane_bytes;
-
-        last_stride[i] =
-            cfg->planes[i].plane_stride;
-
-        last_slice_height[i] =
-            cfg->planes[i].slice_height;
-
-        last_plane_bytes[i] =
-            plane_bytes;
-
-        injected = 1;
     }
 
     last_width = width;
     last_height = height;
-    last_plane_count = plane_count;
 
-    frame_index++;
-    inject_count++;
+    last_stride_y = stride_y;
+    last_stride_uv = stride_uv;
+
+    last_slice_y = slice_y;
+    last_slice_uv = slice_uv;
+
+    injection_counter++;
+
+    frame_counter++;
 
     if (inject_mode == INJECT_ONCE)
-        inject_mode = INJECT_DISABLED;
+        inject_mode = INJECT_OFF;
 
-    mutex_unlock(&inject_lock);
+    pr_info(
+        "cam-ubwc-injector: "
+        "REQ=%llu injected frame=%lu "
+        "%ux%u "
+        "Y[stride=%u slice=%u bytes=%u] "
+        "UV[stride=%u slice=%u bytes=%u] "
+        "pattern=%u\n",
+        request_id,
+        frame_counter - 1,
+        width,
+        height,
+        stride_y,
+        slice_y,
+        y_bytes,
+        stride_uv,
+        slice_uv,
+        uv_bytes,
+        pattern_mode);
 
-    return injected;
+    return 1;
 }
 
 
-static int inject_packet_inputs(
+/*
+ * Scan the packet's IO configurations and replace
+ * the TP10 input buffer contents.
+ */
+static int inject_packet(
         struct kp_cam_packet *packet)
 {
     struct kp_cam_buf_io_cfg *io_cfg;
-
     unsigned int i;
-    int injected = 0;
+    int count = 0;
 
     if (!packet)
         return 0;
 
     if (!packet->num_io_configs ||
         packet->num_io_configs > MAX_IO_CFG)
+        return 0;
+
+    if (inject_mode == INJECT_OFF)
         return 0;
 
     io_cfg =
@@ -509,22 +720,25 @@ static int inject_packet_inputs(
          i < packet->num_io_configs;
          i++) {
 
-        if (inject_mode == INJECT_DISABLED)
-            break;
-
         if (io_cfg[i].direction != CAM_BUF_INPUT)
             continue;
 
         if (io_cfg[i].format != CAM_FORMAT_TP10)
             continue;
 
-        if (inject_one_cfg(
+        count +=
+            inject_io_cfg(
                 &io_cfg[i],
-                packet->header.request_id))
-            injected++;
+                packet->header.request_id);
+
+        /*
+         * We only want the first TP10 input of a request.
+         */
+        if (count)
+            break;
     }
 
-    return injected;
+    return count;
 }
 
 
@@ -533,12 +747,9 @@ static void before_prepare(
         void *udata)
 {
     struct kp_cam_packet *packet;
-    int injected;
+    int count;
 
-    /*
-     * Keep this path extremely cheap when disabled.
-     */
-    if (inject_mode == INJECT_DISABLED)
+    if (inject_mode == INJECT_OFF)
         return;
 
     packet =
@@ -547,132 +758,33 @@ static void before_prepare(
     if (!packet)
         return;
 
-    injected =
-        inject_packet_inputs(packet);
+    count =
+        inject_packet(packet);
 
-    if (injected) {
+    if (count) {
+
         pr_info(
             "cam-ubwc-injector: "
-            "REQ=%llu injected=%d frame=%lu "
-            "size=%lu %ux%u planes=%u\n",
+            "PREP req=%llu "
+            "injected=%d "
+            "total=%lu\n",
             packet->header.request_id,
-            injected,
-            frame_index - 1,
-            inject_size,
-            last_width,
-            last_height,
-            last_plane_count);
+            count,
+            injection_counter);
     }
 }
 
 
-static int load_frame_file(
-        const char *path)
-{
-    unsigned char *new_data = NULL;
-    unsigned long new_size = 0;
-    unsigned char *old_data;
-    int rc;
-
-    rc = file_read_all(
-        path,
-        &new_data,
-        &new_size);
-
-    if (rc)
-        return rc;
-
-    mutex_lock(&inject_lock);
-
-    old_data = inject_data;
-
-    inject_data = new_data;
-    inject_size = new_size;
-
-    frame_index = 0;
-    inject_count = 0;
-
-    last_width = 0;
-    last_height = 0;
-    last_plane_count = 0;
-
-    memset(
-        last_stride,
-        0,
-        sizeof(last_stride));
-
-    memset(
-        last_slice_height,
-        0,
-        sizeof(last_slice_height));
-
-    memset(
-        last_plane_bytes,
-        0,
-        sizeof(last_plane_bytes));
-
-    mutex_unlock(&inject_lock);
-
-    if (old_data)
-        vfree(old_data);
-
-    pr_info(
-        "cam-ubwc-injector: loaded "
-        "%s size=%lu\n",
-        path,
-        new_size);
-
-    return 0;
-}
-
-
-static void report_status(
-        char *out,
-        unsigned int outlen)
-{
-    unsigned long total_frames = 0;
-
-    if (!out || !outlen)
-        return;
-
-    mutex_lock(&inject_lock);
-
-    if (inject_size && last_width) {
-
-        unsigned long frame_size = 0;
-        unsigned int i;
-
-        for (i = 0; i < last_plane_count; i++)
-            frame_size += last_plane_bytes[i];
-
-        if (frame_size)
-            total_frames =
-                inject_size / frame_size;
-    }
-
-    scnprintf(
-        out,
-        outlen,
-        "mode=%d size=%lu frame=%lu injected=%d "
-        "last=%ux%u planes=%u frames=%lu",
-        inject_mode,
-        inject_size,
-        frame_index,
-        inject_count,
-        last_width,
-        last_height,
-        last_plane_count,
-        total_frames);
-
-    mutex_unlock(&inject_lock);
-}
-
-
+/*
+ * KPM init
+ */
 static long cam_kpm_init(
         const char *args,
         const char *event,
         void *reserved)
 {
+    int rc;
+
     addr_prepare =
         kallsyms_lookup_name(
             "cam_ife_mgr_prepare_hw_update");
@@ -687,21 +799,56 @@ static long cam_kpm_init(
 
     pr_info(
         "cam-ubwc-injector: "
-        "prepare=%lx get_cpu=%lx cache=%lx\n",
+        "prepare=%lx "
+        "get_cpu=%lx "
+        "cache=%lx\n",
         addr_prepare,
         (unsigned long)p_cam_mem_get_cpu_buf,
         (unsigned long)p_cam_mem_mgr_cache_ops);
 
-    if (!addr_prepare ||
-        !p_cam_mem_get_cpu_buf)
+    if (!addr_prepare) {
+        pr_info(
+            "cam-ubwc-injector: "
+            "prepare symbol not found\n");
         return -1;
+    }
 
-    if (hook_wrap2(
+    if (!p_cam_mem_get_cpu_buf) {
+        pr_info(
+            "cam-ubwc-injector: "
+            "cam_mem_get_cpu_buf not found\n");
+        return -1;
+    }
+
+    /*
+     * Cache API is optional in the first version.
+     * The injector can still run on uncached buffers.
+     */
+    if (p_cam_mem_mgr_cache_ops == 0) {
+        pr_info(
+            "cam-ubwc-injector: "
+            "cache_ops symbol not found\n");
+    }
+
+    rc =
+        hook_wrap2(
             (void *)addr_prepare,
             before_prepare,
             NULL,
-            NULL))
+            NULL);
+
+    if (rc) {
+        pr_info(
+            "cam-ubwc-injector: "
+            "hook failed rc=%d\n",
+            rc);
         return -1;
+    }
+
+    inject_mode = INJECT_OFF;
+    pattern_mode = PATTERN_MOVING_BAR;
+    frame_counter = 0;
+    injection_counter = 0;
 
     pr_info(
         "cam-ubwc-injector: init ok\n");
@@ -710,167 +857,138 @@ static long cam_kpm_init(
 }
 
 
+/*
+ * KPM control interface.
+ *
+ * Commands:
+ *
+ *   start
+ *   once
+ *   stop
+ *
+ *   black
+ *   white
+ *   hgrad
+ *   vgrad
+ *   bar
+ *
+ *   status
+ *   reset
+ */
 static long cam_kpm_control0(
         const char *args,
         char __user *out_msg,
         int outlen)
 {
-    char reply[192];
+    const char *reply = "ok";
 
     if (!args)
-        return -EINVAL;
+        return -1;
 
-    memset(reply, 0, sizeof(reply));
+    if (!strcmp(args, "start")) {
 
-    /*
-     * load:/data/local/tmp/test.tp10v
-     */
-    if (!strncmp(args, "load:", 5)) {
-
-        int rc;
-
-        rc = load_frame_file(
-            args + 5);
-
-        if (rc) {
-            scnprintf(
-                reply,
-                sizeof(reply),
-                "load failed rc=%d",
-                rc);
-        } else {
-            scnprintf(
-                reply,
-                sizeof(reply),
-                "load ok size=%lu",
-                inject_size);
-        }
-
-        compat_copy_to_user(
-            out_msg,
-            reply,
-            min((unsigned int)strlen(reply) + 1,
-                (unsigned int)outlen));
-
-        return 0;
-    }
-
-    if (!strcmp(args, "start") ||
-        !strcmp(args, "loop")) {
-
-        mutex_lock(&inject_lock);
-
-        if (!inject_data || !inject_size) {
-            mutex_unlock(&inject_lock);
-
-            compat_copy_to_user(
-                out_msg,
-                "no frame loaded",
-                16);
-
-            return 0;
-        }
-
-        frame_index = 0;
-        inject_count = 0;
         inject_mode = INJECT_LOOP;
 
-        mutex_unlock(&inject_lock);
-
-        compat_copy_to_user(
-            out_msg,
-            "started",
-            8);
+        reply = "started";
 
         pr_info(
-            "cam-ubwc-injector: continuous mode\n");
+            "cam-ubwc-injector: "
+            "continuous injection enabled\n");
 
-        return 0;
-    }
-
-    if (!strcmp(args, "once")) {
-
-        mutex_lock(&inject_lock);
-
-        if (!inject_data || !inject_size) {
-            mutex_unlock(&inject_lock);
-
-            compat_copy_to_user(
-                out_msg,
-                "no frame loaded",
-                16);
-
-            return 0;
-        }
+    } else if (!strcmp(args, "once")) {
 
         inject_mode = INJECT_ONCE;
 
-        mutex_unlock(&inject_lock);
-
-        compat_copy_to_user(
-            out_msg,
-            "armed once",
-            10);
+        reply = "armed once";
 
         pr_info(
-            "cam-ubwc-injector: one-shot mode\n");
+            "cam-ubwc-injector: "
+            "one-shot injection enabled\n");
 
-        return 0;
-    }
+    } else if (!strcmp(args, "stop")) {
 
-    if (!strcmp(args, "stop")) {
+        inject_mode = INJECT_OFF;
 
-        mutex_lock(&inject_lock);
-        inject_mode = INJECT_DISABLED;
-        mutex_unlock(&inject_lock);
-
-        compat_copy_to_user(
-            out_msg,
-            "stopped",
-            8);
+        reply = "stopped";
 
         pr_info(
-            "cam-ubwc-injector: stopped\n");
+            "cam-ubwc-injector: "
+            "injection stopped\n");
 
-        return 0;
-    }
+    } else if (!strcmp(args, "black")) {
 
-    if (!strcmp(args, "status")) {
+        pattern_mode = PATTERN_FLAT_BLACK;
 
-        report_status(
-            reply,
-            sizeof(reply));
+        reply = "black";
 
-        compat_copy_to_user(
-            out_msg,
-            reply,
-            min((unsigned int)strlen(reply) + 1,
-                (unsigned int)outlen));
+    } else if (!strcmp(args, "white")) {
 
-        return 0;
-    }
+        pattern_mode = PATTERN_FLAT_WHITE;
 
-    if (!strcmp(args, "reset")) {
+        reply = "white";
 
-        mutex_lock(&inject_lock);
+    } else if (!strcmp(args, "hgrad")) {
 
-        frame_index = 0;
-        inject_count = 0;
+        pattern_mode = PATTERN_HORIZONTAL;
 
-        mutex_unlock(&inject_lock);
+        reply = "horizontal";
 
-        compat_copy_to_user(
-            out_msg,
-            "reset",
-            6);
+    } else if (!strcmp(args, "vgrad")) {
 
-        return 0;
+        pattern_mode = PATTERN_VERTICAL;
+
+        reply = "vertical";
+
+    } else if (!strcmp(args, "bar")) {
+
+        pattern_mode = PATTERN_MOVING_BAR;
+
+        reply = "moving-bar";
+
+    } else if (!strcmp(args, "reset")) {
+
+        frame_counter = 0;
+        injection_counter = 0;
+
+        reply = "reset";
+
+    } else if (!strcmp(args, "status")) {
+
+        static char msg[256];
+
+        /*
+         * Avoid relying on snprintf from the full kernel headers.
+         * kstrto* / printk facilities are intentionally kept out.
+         */
+        pr_info(
+            "cam-ubwc-injector: "
+            "status mode=%d pattern=%d "
+            "frames=%lu injected=%lu "
+            "last=%ux%u "
+            "Y[%u,%u] UV[%u,%u]\n",
+            inject_mode,
+            pattern_mode,
+            frame_counter,
+            injection_counter,
+            last_width,
+            last_height,
+            last_stride_y,
+            last_slice_y,
+            last_stride_uv,
+            last_slice_uv);
+
+        reply = "status printed";
+
+    } else {
+
+        reply =
+            "start once stop black white hgrad vgrad bar status reset";
     }
 
     compat_copy_to_user(
         out_msg,
-        "commands: load:<path> start once stop status reset",
-        49);
+        reply,
+        (unsigned int)strlen(reply) + 1);
 
     return 0;
 }
@@ -879,21 +997,11 @@ static long cam_kpm_control0(
 static long cam_kpm_exit(
         void *reserved)
 {
-    unsigned char *old_data;
-
-    inject_mode = INJECT_DISABLED;
+    inject_mode = INJECT_OFF;
 
     if (addr_prepare)
-        unhook((void *)addr_prepare);
-
-    mutex_lock(&inject_lock);
-    old_data = inject_data;
-    inject_data = NULL;
-    inject_size = 0;
-    mutex_unlock(&inject_lock);
-
-    if (old_data)
-        vfree(old_data);
+        unhook(
+            (void *)addr_prepare);
 
     pr_info(
         "cam-ubwc-injector: exit\n");
