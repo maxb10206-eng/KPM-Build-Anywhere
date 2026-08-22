@@ -42,6 +42,38 @@ jobs:
           export NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
           make NDK_PATH="$NDK_PATH"
 
+      - name: 诊断 ELF relocation
+        if: always()
+        run: |
+          export NDK_PATH="${{ steps.setup-ndk.outputs.ndk-path }}"
+          export LLVM_BIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          echo "===== pwd ====="
+          pwd
+
+          echo "===== files ====="
+          find . -maxdepth 3 -type f \
+            \( -name "*.o" -o -name "*.kpm" \) \
+            -print
+
+          echo "===== hello.o relocation ====="
+          if [ -f hello.o ]; then
+            "$LLVM_BIN/llvm-readelf" -r hello.o || true
+          fi
+
+          echo "===== all object relocations ====="
+          find . -type f -name "*.o" -print0 |
+          while IFS= read -r -d '' obj; do
+            echo
+            echo "===== $obj ====="
+            "$LLVM_BIN/llvm-readelf" -r "$obj" || true
+          done
+
+          echo "===== symbols ====="
+          if [ -f hello.o ]; then
+            "$LLVM_BIN/llvm-readelf" -s hello.o || true
+          fi
+
       - name: 打包并上传成品
         uses: actions/upload-artifact@v4
         with:
@@ -50,3 +82,4 @@ jobs:
             ./*.kpm
             out/*.kpm
             build/*.kpm
+            hello.o
