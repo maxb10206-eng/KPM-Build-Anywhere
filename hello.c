@@ -3,6 +3,7 @@
 #include <linux/printk.h>
 #include <kputils.h>
 #include <hook.h>
+#include <errno.h>
 
 KPM_NAME("cam-ubwc-a2-rd-switch");
 KPM_VERSION("1.2.0");
