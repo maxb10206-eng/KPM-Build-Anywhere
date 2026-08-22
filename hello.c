@@ -4,53 +4,31 @@
 #include <kputils.h>
 #include <hook.h>
 
-/*
- * A2 第一阶段：
- *
- * cam_ife_mgr_acquire()
- *      ↓
- * cam_hw_acquire_args
- *      ↓
- * cam_isp_acquire_hw_info
- *      ↓
- * cam_isp_in_port_info_v2
- *      ↓
- * res_type = CAM_ISP_IFE_IN_RES_RD
- * offline_mode = 1
- *
- * 这一版只验证 acquire 路径，不替换帧内容。
- */
-
 KPM_NAME("cam-ubwc-a2-rd-switch");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("KC");
 KPM_DESCRIPTION("A2 IFE RD acquire-path probe");
 
-#define CAM_API_COMPAT_CONSTANT 1
-
 /*
- * 这里不要再硬编码 CAM_ISP_IFE_IN_RES_BASE。
+ * Confirmed from the target OnePlus kernel source:
  *
- * 你的 kernel 源码里：
+ * cam_isp_ife.h:
  *
- *   #define CAM_ISP_IFE_IN_RES_RD
- *       (CAM_ISP_IFE_IN_RES_BASE + 7)
+ *   #define CAM_ISP_IFE_IN_RES_BASE 0x4000
+ *   #define CAM_ISP_IFE_IN_RES_RD   (CAM_ISP_IFE_IN_RES_BASE + 7)
  *
- * 因此优先直接包含你实际 OnePlus kernel 的 UAPI 头。
+ * Therefore:
  *
- * 如果你的 Makefile 已经提供：
- *
- *   -I.../vendor/qcom/opensource/camera-kernel/include/uapi
- *
- * 那么下面这个 include 可以直接工作。
+ *   CAM_ISP_IFE_IN_RES_RD = 0x4007
  */
-#include <camera/media/cam_isp_ife.h>
+#define CAM_ISP_IFE_IN_RES_RD 0x4007U
+
 
 /*
- * cam_hw_acquire_args
+ * struct cam_hw_acquire_stream_caps
  *
- * 来自：
+ * From:
  * drivers/cam_core/cam_hw_mgr_intf.h
  */
 struct kp_cam_hw_acquire_stream_caps {
@@ -58,10 +36,18 @@ struct kp_cam_hw_acquire_stream_caps {
     unsigned int param_list[4];
 };
 
+
+/*
+ * struct cam_hw_acquire_args
+ *
+ * From:
+ * drivers/cam_core/cam_hw_mgr_intf.h
+ */
 struct kp_cam_hw_acquire_args {
     void *context_data;
     unsigned int ctx_id;
     void *event_cb;
+
     unsigned int num_acq;
     unsigned int acquire_info_size;
     uintptr_t acquire_info;
@@ -75,39 +61,47 @@ struct kp_cam_hw_acquire_args {
     unsigned int valid_acquired_hw;
 
     struct kp_cam_hw_acquire_stream_caps op_params;
+
     void *mini_dump_cb;
 };
 
+
 /*
- * cam_isp_acquire_hw_info
+ * struct cam_isp_acquire_hw_info
  *
- * 这里我们只使用前面的固定字段。
- * data[] 不需要知道具体内容。
+ * Fields confirmed from cam_ife_hw_mgr.c usage.
  */
 struct kp_cam_isp_acquire_hw_info {
     unsigned int num_inputs;
     unsigned int input_info_size;
     unsigned int input_info_offset;
     unsigned int input_info_version;
+
     unsigned char data[1];
 };
 
+
 /*
- * cam_isp_in_port_info_v2
+ * struct cam_isp_in_port_info_v2
  *
- * 来自：
- * vendor/qcom/opensource/camera-kernel/include/uapi/camera/media/cam_isp.h
+ * Layout confirmed from cam_isp.h:
  *
- * 这里保留到 offline_mode 之前及其后需要的字段。
+ *   res_type
+ *   lane_type
+ *   lane_num
+ *   lane_cfg
+ *   vc[]
+ *   dt[]
+ *   num_valid_vc_dt
+ *   format
+ *   test_pattern
+ *   usage_type
+ *   ...
+ *   num_out_res
+ *   offline_mode
+ *   ...
  *
- * 关键布局：
- *
- * 0x00 res_type
- * ...
- * 0x64 num_out_res
- * 0x68 offline_mode
- *
- * 后面的 data[] 本版本不处理。
+ * This first-stage probe only needs fields through sfe_in_path_type.
  */
 struct kp_cam_isp_in_port_info_v2 {
     unsigned int res_type;
@@ -120,6 +114,7 @@ struct kp_cam_isp_in_port_info_v2 {
     unsigned int dt[4];
 
     unsigned int num_valid_vc_dt;
+
     unsigned int format;
     unsigned int test_pattern;
     unsigned int usage_type;
@@ -149,20 +144,23 @@ struct kp_cam_isp_in_port_info_v2 {
     unsigned int bidirectional_bin;
     unsigned int qcfa_bin;
     unsigned int sfe_in_path_type;
+
     unsigned int feature_flag;
     unsigned int ife_res_1;
     unsigned int ife_res_2;
 };
 
+
 /*
- * 状态
+ * Global state.
  */
 static unsigned long acquire_addr;
 static volatile int armed;
 static volatile unsigned int switch_count;
 
+
 /*
- * 输出一份输入端信息。
+ * Dump input-port information.
  */
 static void dump_port(
     unsigned int index,
@@ -195,16 +193,11 @@ static void dump_port(
         in->sfe_in_path_type);
 }
 
+
 /*
- * 判断是否像一个正常 Pixel 输入。
+ * Identify a normal pixel input candidate.
  *
- * 第一版故意保守：
- *
- * 1. 必须有输出资源
- * 2. 必须有有效尺寸
- * 3. 不能已经是 RD
- * 4. 不处理 SFE RD
- * 5. 不处理纯 RDI
+ * We intentionally keep the first version conservative.
  */
 static int is_candidate_pixel_input(
     const struct kp_cam_isp_in_port_info_v2 *in)
@@ -212,17 +205,26 @@ static int is_candidate_pixel_input(
     if (!in)
         return 0;
 
+    /*
+     * No output resource -> not our target.
+     */
     if (!in->num_out_res)
         return 0;
 
+    /*
+     * Invalid geometry -> not our target.
+     */
     if (!in->left_width || !in->height)
         return 0;
 
+    /*
+     * Already RD -> don't modify.
+     */
     if (in->res_type == CAM_ISP_IFE_IN_RES_RD)
         return 0;
 
     /*
-     * SFE RD / Fetch 类型先不要碰。
+     * Don't touch SFE fetch paths in this first version.
      */
     if (in->sfe_in_path_type)
         return 0;
@@ -230,24 +232,13 @@ static int is_candidate_pixel_input(
     return 1;
 }
 
+
 /*
- * cam_ife_mgr_acquire(
- *      void *hw_mgr_priv,
- *      void *acquire_hw_args
- * )
+ * Hook:
  *
- * hook_fargs2_t：
- *
- * args->arg0 = 第一个参数
- * args->arg1 = 第二个参数
- *
- * 这里最重要的修正：
- *
- * 错误：
- *   *(struct ... **)args->arg1
- *
- * 正确：
- *   (struct ... *)args->arg1
+ * static int cam_ife_mgr_acquire(
+ *     void *hw_mgr_priv,
+ *     void *acquire_hw_args)
  */
 static void before_acquire(
     hook_fargs2_t *args,
@@ -258,20 +249,13 @@ static void before_acquire(
     struct kp_cam_isp_in_port_info_v2 *in;
     unsigned int i;
 
-    if (!args) {
+    if (!args)
         return;
-    }
 
     /*
-     * 最早日志。
+     * Always print this first.
      *
-     * 这一条最重要。
-     *
-     * 如果打开相机后能看到：
-     *
-     *   cam-a2: ENTER acquire
-     *
-     * 就证明 hook 真正进入了 cam_ife_mgr_acquire。
+     * This lets us confirm whether the hook is really entered.
      */
     pr_info(
         "cam-a2: ENTER acquire arg0=%pK arg1=%pK armed=%d\n",
@@ -286,7 +270,10 @@ static void before_acquire(
         return;
 
     /*
-     * 修正后的参数读取方式。
+     * Important:
+     *
+     * arg1 is already void *acquire_hw_args.
+     * Do NOT dereference arg1 again.
      */
     acq = (struct kp_cam_hw_acquire_args *)args->arg1;
 
@@ -305,22 +292,14 @@ static void before_acquire(
         acq->acquire_info_size,
         acq->ctx_id);
 
-    if (!acq->acquire_info) {
-        pr_info("cam-a2: acquire_info=NULL\n");
+    if (!acq->acquire_info)
         return;
-    }
 
-    if (!acq->acquire_info_size) {
-        pr_info("cam-a2: acquire_info_size=0\n");
+    if (!acq->acquire_info_size)
         return;
-    }
 
-    if (acq->num_acq == 0 || acq->num_acq > 16) {
-        pr_info(
-            "cam-a2: invalid num_acq=%u\n",
-            acq->num_acq);
+    if (!acq->num_acq || acq->num_acq > 16)
         return;
-    }
 
     info = (struct kp_cam_isp_acquire_hw_info *)
         (uintptr_t)acq->acquire_info;
@@ -336,30 +315,30 @@ static void before_acquire(
         info->input_info_offset,
         info->input_info_version);
 
-    if (!info->num_inputs || info->num_inputs > 16) {
-        pr_info(
-            "cam-a2: invalid num_inputs=%u\n",
-            info->num_inputs);
+    if (!info->num_inputs || info->num_inputs > 16)
         return;
-    }
 
-    if (info->input_info_offset >= info->input_info_size) {
-        pr_info(
-            "cam-a2: invalid input offset=0x%x size=0x%x\n",
-            info->input_info_offset,
-            info->input_info_size);
+    if (info->input_info_offset >= info->input_info_size)
         return;
-    }
 
+    /*
+     * The v2 parser in cam_ife_hw_mgr.c computes:
+     *
+     *   in_port =
+     *       (uint8_t *)&acquire_hw_info->data +
+     *       input_info_offset;
+     */
     in = (struct kp_cam_isp_in_port_info_v2 *)
-        ((unsigned char *)info->data +
+        ((unsigned char *)&info->data[0] +
          info->input_info_offset);
 
     /*
-     * 第一版只处理第一个输入。
+     * First-stage test:
      *
-     * 不在这里根据 data[] 大小继续跨 input，
-     * 避免因为 vendor 结构体大小差异产生越界。
+     * Only inspect the first input.
+     *
+     * We deliberately do not walk variable-length output-port
+     * records here yet.
      */
     for (i = 0; i < 1; i++) {
 
@@ -372,9 +351,6 @@ static void before_acquire(
             break;
         }
 
-        /*
-         * 记录原始状态。
-         */
         pr_info(
             "cam-a2: SWITCH port=%u "
             "old_res=0x%x "
@@ -387,9 +363,9 @@ static void before_acquire(
             CAM_ISP_IFE_IN_RES_RD);
 
         /*
-         * 核心实验：
+         * Experimental A2 switch:
          *
-         * 普通 Pixel input
+         * normal pixel source
          *        ↓
          * IFE RD input
          */
@@ -406,10 +382,20 @@ static void before_acquire(
 
         break;
     }
+
+    pr_info(
+        "cam-a2: acquire processed "
+        "num_inputs=%u "
+        "input_ver=0x%x "
+        "switches=%u\n",
+        info->num_inputs,
+        info->input_info_version,
+        switch_count);
 }
 
+
 /*
- * KPM init
+ * KPM initialization.
  */
 static long cam_kpm_init(
     const char *args,
@@ -420,9 +406,6 @@ static long cam_kpm_init(
     armed = 0;
     switch_count = 0;
 
-    /*
-     * 找 cam_ife_mgr_acquire。
-     */
     acquire_addr =
         kallsyms_lookup_name("cam_ife_mgr_acquire");
 
@@ -436,9 +419,6 @@ static long cam_kpm_init(
         return -1;
     }
 
-    /*
-     * 安装 hook。
-     */
     if (hook_wrap2(
             (void *)acquire_addr,
             before_acquire,
@@ -458,12 +438,13 @@ static long cam_kpm_init(
     return 0;
 }
 
+
 /*
- * control0
+ * Runtime control:
  *
- * on     -> 开启实验
- * off    -> 关闭实验
- * status -> 查看状态
+ *   on
+ *   off
+ *   status
  */
 static long cam_kpm_control0(
     const char *args,
@@ -546,8 +527,9 @@ static long cam_kpm_control0(
     return -EINVAL;
 }
 
+
 /*
- * KPM exit
+ * KPM unload.
  */
 static long cam_kpm_exit(
     void *reserved)
@@ -565,6 +547,7 @@ static long cam_kpm_exit(
 
     return 0;
 }
+
 
 KPM_INIT(cam_kpm_init);
 KPM_CTL0(cam_kpm_control0);
